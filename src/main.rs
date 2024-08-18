@@ -1,13 +1,10 @@
 use anyhow::Result;
-use wasmparser::Parser;
+use wasm_jit::parser;
 
 fn main() -> Result<()> {
     let bytes = include_bytes!("../tests/wasm/add.wasm");
-    let parser = Parser::new(0);
+    let modules = parser::parse(bytes)?;
+    println!("{:?}", modules);
 
-    for payload in parser.parse_all(bytes) {
-        let payload = payload?;
-        println!("{:?}", payload);
-    }
     Ok(())
 }
