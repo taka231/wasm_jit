@@ -1,7 +1,7 @@
 use anyhow::Result;
 use wasmparser::{Parser, Payload::*};
 
-use crate::wasm::WasmModule;
+use crate::wasm::{Func, WasmModule};
 
 pub fn parse(buf: &[u8]) -> Result<WasmModule<'_>> {
     let parser = Parser::new(0);
@@ -20,12 +20,20 @@ pub fn parse(buf: &[u8]) -> Result<WasmModule<'_>> {
                 }
             }
             CodeSectionEntry(body) => {
+                let local_reader = body.get_locals_reader()?;
+                let mut locals = Vec::new();
+                for local in local_reader {
+                    locals.push(local?);
+                }
                 let body = body.get_operators_reader()?;
                 let mut instrs = Vec::new();
                 for instr in body {
                     instrs.push(instr?);
                 }
-                module.code.push(instrs);
+                module.code.push(Func {
+                    locals,
+                    body: instrs,
+                });
             }
             ExportSection(exports) => {
                 for export in exports {
