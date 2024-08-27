@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.86"
 libc = "0.2.158"
+thiserror = "1.0.63"
 wasmparser = "0.215.0"

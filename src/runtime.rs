@@ -1,10 +1,16 @@
-use std::collections::HashMap;
+pub mod error;
+
+use std::{
+    alloc::{Layout, LayoutError},
+    collections::HashMap,
+};
 
 use crate::{
     compiler::Compiler,
     wasm::{Func, WasmModule},
 };
 use anyhow::{bail, Context as _, Result};
+use error::RuntimeError;
 use wasmparser::{Export, ExternalKind, FuncType, ValType};
 
 #[derive(Debug, Default)]
@@ -33,12 +39,12 @@ impl Value {
         }
     }
 
-    fn from_u64(bytes: &u64, value_type: &ValType) -> Value {
+    fn from_u64(bytes: u64, value_type: &ValType) -> Value {
         match value_type {
-            ValType::I32 => Value::I32(*bytes as i32),
-            ValType::I64 => Value::I64(*bytes as i64),
-            ValType::F32 => Value::F32(f32::from_bits(*bytes as u32)),
-            ValType::F64 => Value::F64(f64::from_bits(*bytes)),
+            ValType::I32 => Value::I32(bytes as i32),
+            ValType::I64 => Value::I64(bytes as i64),
+            ValType::F32 => Value::F32(f32::from_bits(bytes as u32)),
+            ValType::F64 => Value::F64(f64::from_bits(bytes)),
             _ => unimplemented!("Unsupported value type: {:?}", value_type),
         }
     }
@@ -65,31 +71,45 @@ impl<'a> Runtime<'a> {
         let Export { name, kind, index } = self
             .exports
             .get(name)
-            .with_context(|| format!("Export not found: {}", name))?;
+            .with_context(|| RuntimeError::ExportNotFound(name.into()))?;
         if *kind != ExternalKind::Func {
             bail!("Export kind is not a function: {}", name);
         }
         let type_index = self
             .funcs
             .get(*index as usize)
-            .with_context(|| format!("Function not found: {}", name))?;
+            .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
         let func_type = self
             .types
             .get(*type_index as usize)
-            .with_context(|| format!("Function type not found: {}", name))?;
-        let args = args.iter().map(|arg| arg.to_u64()).collect::<Vec<u64>>();
+            .with_context(|| RuntimeError::FunctionTypeNotFound((*name).into()))?;
+        let mut args = args.iter().map(|arg| arg.to_u64()).collect::<Vec<u64>>();
         unsafe {
             let mut compiler = Compiler::new()?;
             let func = self
                 .code
                 .get(*index as usize)
-                .with_context(|| format!("Function not found: {}", name))?;
+                .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
             compiler.compile_func(&func, &func_type);
-            let code: fn() -> u64 = std::mem::transmute(compiler.p_start);
-            let result = code();
+            let args = args.as_mut_ptr();
+            let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
+            let code: fn(*mut u64, *mut u64) -> () = std::mem::transmute(compiler.p_start);
+            code(args, result);
+            if *result != 0 {
+                let error = result.add(1) as *const anyhow::Error;
+                if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
+                    bail!(runtime_error.clone());
+                }
+                if let Some(error) = (*error).downcast_ref::<LayoutError>() {
+                    bail!(error.clone());
+                }
+                bail!("Something went wrong");
+            }
+            let value = *result.add(1);
+            std::alloc::dealloc(result as *mut u8, Layout::from_size_align(16, 8)?);
 
             compiler.free()?;
-            Ok(vec![Value::from_u64(&result, &func_type.results()[0])])
+            Ok(vec![Value::from_u64(value, &func_type.results()[0])])
         }
     }
 }

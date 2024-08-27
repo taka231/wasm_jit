@@ -1,6 +1,5 @@
-use anyhow::Result;
 use libc::{c_int, c_void, size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use wasmparser::{FuncType, Operator};
 
 use crate::wasm::Func;
@@ -18,7 +17,7 @@ const CODE_AREA_SIZE: usize = 1024;
 const PAGE_SIZE: usize = 4096;
 
 impl Compiler {
-    pub unsafe fn new() -> Result<Compiler> {
+    pub unsafe fn new() -> Result<Compiler, LayoutError> {
         let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE)?;
         let p_start = alloc(layout);
         let r = mprotect(
@@ -33,7 +32,7 @@ impl Compiler {
         })
     }
 
-    pub unsafe fn free(&self) -> Result<()> {
+    pub unsafe fn free(&self) -> Result<(), LayoutError> {
         let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE)?;
         let r = mprotect(
             self.p_start as *const c_void,
@@ -67,6 +66,23 @@ impl Compiler {
     unsafe fn compile(&mut self, instrs: &[Operator<'_>]) {
         for instr in instrs {
             match instr {
+                Operator::LocalGet { local_index } => {
+                    let offset = 16 + local_index * 8;
+                    if offset <= 128 {
+                        // mov rax, [rbp - offset]
+                        self.push_code(&[0x48, 0x8b, 0x45, (256 - offset) as u8])
+                    } else {
+                        // mov rax, [rbp - offset]
+                        self.push_code(
+                            &[
+                                &[0x48, 0x8b, 0x85],
+                                &(u32::MAX - offset + 1).to_le_bytes()[..],
+                            ]
+                            .concat(),
+                        )
+                    }
+                    self.push_rax();
+                }
                 Operator::I32Const { value } => {
                     let value = *value as u32;
                     let value_bytes = value.to_le_bytes();
@@ -113,8 +129,18 @@ impl Compiler {
     }
 
     pub unsafe fn compile_func(&mut self, func: &Func<'_>, func_type: &FuncType) {
-        if func_type.params().len() > 0 {
-            unimplemented!("function parameters are not supported yet");
+        self.push_code(&[0x55]); // push rbp
+        self.push_code(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
+        self.push_code(&[0x56]); // push rsi
+        for i in 0..func_type.params().len() {
+            if i == 0 {
+                self.push_code(&[0x48, 0x8b, 0x07]); // mov rax, [rdi]
+            } else if i < 128 / 8 {
+                self.push_code(&[0x48, 0x8b, 0x47, i as u8 * 8]); // mov rax, [rdi + i * 8]
+            } else {
+                unimplemented!("more than 16 parameters are not supported yet");
+            }
+            self.push_rax();
         }
         if func.locals.len() > 0 {
             unimplemented!("local variables are not supported yet");
@@ -124,6 +150,12 @@ impl Compiler {
             unimplemented!("multiple return values are not supported yet");
         }
         self.pop_rax();
+        self.push_code(&[0x48, 0x8b, 0x4d, 0xf8]); // mov rcx, [rbp - 8]
+        self.push_code(&[0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00]); // mov rdx, 0
+        self.push_code(&[0x48, 0x89, 0x11]); // mov [rcx], rdx
+        self.push_code(&[0x48, 0x89, 0x41, 0x08]); // mov [rcx + 8], rax
+        self.push_code(&[0x48, 0x89, 0xec]); // mov rsp, rbp
+        self.push_code(&[0x5d]); // pop rbp
         self.push_code(&[0xc3]); // ret
     }
 }
