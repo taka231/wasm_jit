@@ -24,6 +24,10 @@ fn test_add_with_args() -> Result<()> {
     assert_eq!(result, vec![Value::I64(30)]);
     let result = runtime.call_func_by_name("add", &[Value::I64(1000), Value::I64(2000)])?;
     assert_eq!(result, vec![Value::I64(3000)]);
+    let result = runtime.call_func_by_name("add32", &[Value::I32(10), Value::I32(20)])?;
+    assert_eq!(result, vec![Value::I32(30)]);
+    let result = runtime.call_func_by_name("add32", &[Value::I32(1000), Value::I32(2000)])?;
+    assert_eq!(result, vec![Value::I32(3000)]);
 
     Ok(())
 }

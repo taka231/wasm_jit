@@ -118,10 +118,16 @@ impl Compiler {
                 Operator::I32Add | Operator::I64Add => {
                     self.pop_rdi();
                     self.pop_rax();
-                    // 0x48: REX.W prefix
-                    // 0x01: add r/m64, r64
-                    // 0xf8: rdi -> rax
-                    self.push_code(&[0x48, 0x01, 0xf8]);
+                    if instr == &Operator::I32Add {
+                        // 0x01: add r/m32, r32
+                        // 0xf8: rdi -> rax
+                        self.push_code(&[0x01, 0xf8]);
+                    } else {
+                        // 0x48: REX.W prefix
+                        // 0x01: add r/m64, r64
+                        // 0xf8: rdi -> rax
+                        self.push_code(&[0x48, 0x01, 0xf8]);
+                    }
                     self.push_rax();
                 }
                 Operator::End => {}
