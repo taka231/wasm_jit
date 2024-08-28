@@ -13,12 +13,13 @@ use anyhow::{bail, Context as _, Result};
 use error::RuntimeError;
 use wasmparser::{Export, ExternalKind, FuncType, ValType};
 
-#[derive(Debug, Default)]
 pub struct Runtime<'a> {
     types: Vec<FuncType>,
     funcs: Vec<u32>,
     code: Vec<Func<'a>>,
     exports: Exports<'a>,
+    func_cache: HashMap<u32, fn(*mut u64, *mut u64) -> ()>,
+    compiler: Compiler,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,18 +54,20 @@ impl Value {
 type Exports<'a> = HashMap<&'a str, Export<'a>>;
 
 impl<'a> Runtime<'a> {
-    pub fn init(modules: WasmModule<'a>) -> Runtime<'a> {
+    pub fn init(modules: WasmModule<'a>) -> Result<Runtime<'a>> {
         let exports = modules
             .exports
             .into_iter()
             .map(|export| (export.name, export))
             .collect();
-        Runtime {
+        Ok(Runtime {
             types: modules.types,
             funcs: modules.funcs,
             code: modules.code,
             exports,
-        }
+            func_cache: HashMap::new(),
+            compiler: unsafe { Compiler::new()? },
+        })
     }
 
     pub fn call_func_by_name(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
@@ -85,15 +88,21 @@ impl<'a> Runtime<'a> {
             .with_context(|| RuntimeError::FunctionTypeNotFound((*name).into()))?;
         let mut args = args.iter().map(|arg| arg.to_u64()).collect::<Vec<u64>>();
         unsafe {
-            let mut compiler = Compiler::new()?;
-            let func = self
-                .code
-                .get(*index as usize)
-                .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
-            compiler.compile_func(&func, &func_type);
+            let code: fn(*mut u64, *mut u64) -> () = if let Some(code) = self.func_cache.get(index)
+            {
+                *code
+            } else {
+                let func = self
+                    .code
+                    .get(*index as usize)
+                    .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
+                self.compiler.compile_func(&func, &func_type);
+                let code = self.compiler.extract_func();
+                self.func_cache.insert(*index, code);
+                code
+            };
             let args = args.as_mut_ptr();
             let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
-            let code: fn(*mut u64, *mut u64) -> () = std::mem::transmute(compiler.p_start);
             code(args, result);
             if *result != 0 {
                 let error = result.add(1) as *const anyhow::Error;
@@ -108,7 +117,6 @@ impl<'a> Runtime<'a> {
             let value = *result.add(1);
             std::alloc::dealloc(result as *mut u8, Layout::from_size_align(16, 8)?);
 
-            compiler.free()?;
             Ok(vec![Value::from_u64(value, &func_type.results()[0])])
         }
     }

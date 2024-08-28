@@ -11,6 +11,7 @@ extern "C" {
 pub struct Compiler {
     pub p_start: *mut u8,
     pub p_current: *mut u8,
+    pub p_func_start: *mut u8,
 }
 
 const CODE_AREA_SIZE: usize = 1024;
@@ -29,6 +30,7 @@ impl Compiler {
         Ok(Compiler {
             p_start,
             p_current: p_start,
+            p_func_start: p_start,
         })
     }
 
@@ -126,6 +128,12 @@ impl Compiler {
                 _ => unimplemented!("unimplemented instruction: {:?}", instr),
             }
         }
+    }
+
+    pub unsafe fn extract_func(&mut self) -> fn(*mut u64, *mut u64) -> () {
+        let func = std::mem::transmute::<*mut u8, fn(*mut u64, *mut u64) -> ()>(self.p_func_start);
+        self.p_func_start = self.p_current;
+        func
     }
 
     pub unsafe fn compile_func(&mut self, func: &Func<'_>, func_type: &FuncType) {
