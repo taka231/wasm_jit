@@ -1,4 +1,5 @@
 pub mod error;
+pub mod store;
 
 use std::{
     alloc::{Layout, LayoutError},
@@ -6,19 +7,17 @@ use std::{
 };
 
 use crate::{
-    compiler::Compiler,
-    wasm::{Func, WasmModule},
+    compiler::{Compiler, JITFunc},
+    wasm::WasmModule,
 };
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Error, Result};
 use error::RuntimeError;
-use wasmparser::{Export, ExternalKind, FuncType, ValType};
+use store::Store;
+use wasmparser::{Export, ExternalKind, ValType};
 
 pub struct Runtime<'a> {
-    types: Vec<FuncType>,
-    funcs: Vec<u32>,
-    code: Vec<Func<'a>>,
-    exports: Exports<'a>,
-    func_cache: HashMap<u32, fn(*mut u64, *mut u64) -> ()>,
+    store: Store<'a>,
+    func_cache: HashMap<u32, JITFunc>,
     compiler: Compiler,
 }
 
@@ -51,73 +50,84 @@ impl Value {
     }
 }
 
-type Exports<'a> = HashMap<&'a str, Export<'a>>;
-
 impl<'a> Runtime<'a> {
     pub fn init(modules: WasmModule<'a>) -> Result<Runtime<'a>> {
-        let exports = modules
-            .exports
-            .into_iter()
-            .map(|export| (export.name, export))
-            .collect();
+        let store = Store::new(modules);
         Ok(Runtime {
-            types: modules.types,
-            funcs: modules.funcs,
-            code: modules.code,
-            exports,
+            store,
             func_cache: HashMap::new(),
             compiler: unsafe { Compiler::new()? },
         })
     }
 
     pub fn call_func_by_name(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
-        let Export { name, kind, index } = self
-            .exports
-            .get(name)
-            .with_context(|| RuntimeError::ExportNotFound(name.into()))?;
+        let Export { name, kind, index } = self.store.get_export(name)?;
+        let index = *index;
         if *kind != ExternalKind::Func {
             bail!("Export kind is not a function: {}", name);
         }
-        let type_index = self
-            .funcs
-            .get(*index as usize)
-            .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
-        let func_type = self
-            .types
-            .get(*type_index as usize)
-            .with_context(|| RuntimeError::FunctionTypeNotFound((*name).into()))?;
         let mut args = args.iter().map(|arg| arg.to_u64()).collect::<Vec<u64>>();
         unsafe {
-            let code: fn(*mut u64, *mut u64) -> () = if let Some(code) = self.func_cache.get(index)
-            {
-                *code
-            } else {
-                let func = self
-                    .code
-                    .get(*index as usize)
-                    .with_context(|| RuntimeError::FunctionNotFound((*name).into()))?;
-                self.compiler.compile_func(&func, &func_type);
-                let code = self.compiler.extract_func();
-                self.func_cache.insert(*index, code);
-                code
-            };
-            let args = args.as_mut_ptr();
-            let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
-            code(args, result);
-            if *result != 0 {
-                let error = result.add(1) as *const anyhow::Error;
-                if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
-                    bail!(runtime_error.clone());
-                }
-                if let Some(error) = (*error).downcast_ref::<LayoutError>() {
-                    bail!(error.clone());
-                }
-                bail!("Something went wrong");
-            }
-            let value = *result.add(1);
-            std::alloc::dealloc(result as *mut u8, Layout::from_size_align(16, 8)?);
+            let result = self.call_func_by_index(index, &mut args)?;
+            let func_type = self.store.get_func_type_from_func_index(index)?;
 
-            Ok(vec![Value::from_u64(value, &func_type.results()[0])])
+            Ok(vec![Value::from_u64(result[0], &func_type.results()[0])])
         }
+    }
+
+    unsafe fn call_func_by_index(&mut self, index: u32, args: &mut [u64]) -> Result<Vec<u64>> {
+        let code: JITFunc = if let Some(code) = self.func_cache.get(&index) {
+            *code
+        } else {
+            self.compiler.compile_func(index, &self.store)?;
+            let code = self.compiler.extract_func();
+            self.func_cache.insert(index, code);
+            code
+        };
+        let args = args.as_mut_ptr();
+        let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
+        code(args, result, self);
+        if *result != 0 {
+            let error = result.add(1) as *const anyhow::Error;
+            if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
+                bail!(runtime_error.clone());
+            }
+            if let Some(error) = (*error).downcast_ref::<LayoutError>() {
+                bail!(error.clone());
+            }
+            bail!("Something went wrong");
+        }
+        let value = *result.add(1);
+        std::alloc::dealloc(result as *mut u8, Layout::from_size_align(16, 8)?);
+
+        Ok(vec![value])
+    }
+
+    pub(crate) unsafe fn call_func_internal(
+        &mut self,
+        index: u32,
+        result_ptr: *mut u64,
+        args_num: u32,
+        args: *mut u64,
+    ) -> *mut u64 {
+        let args_slice = std::slice::from_raw_parts_mut(args, args_num as usize);
+        let result = self.call_func_by_index(index, args_slice);
+        std::alloc::dealloc(
+            args as *mut u8,
+            Layout::from_size_align(8 * args_num as usize, 8).unwrap(),
+        );
+        match result {
+            Ok(result) => {
+                *result_ptr = 0;
+                *(result_ptr.add(1)) = result[0];
+            }
+            Err(err) => {
+                *result_ptr = 1;
+                assert!(std::mem::size_of::<Error>() <= 8);
+                let error_ptr = result_ptr.add(1) as *mut Error;
+                *error_ptr = err;
+            }
+        }
+        result_ptr
     }
 }

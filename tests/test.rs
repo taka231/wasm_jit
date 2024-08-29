@@ -31,3 +31,14 @@ fn test_add_with_args() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_call() -> Result<()> {
+    let bytes = include_bytes!("../tests/wasm/call.wasm");
+    let modules = parser::parse(bytes)?;
+    let mut runtime = Runtime::init(modules)?;
+    let result = runtime.call_func_by_name("_start", &[])?;
+    assert_eq!(result, vec![Value::I64(300)]);
+
+    Ok(())
+}
