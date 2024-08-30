@@ -1,10 +1,7 @@
 pub mod error;
 pub mod store;
 
-use std::{
-    alloc::{Layout, LayoutError},
-    collections::HashMap,
-};
+use std::{alloc::Layout, collections::HashMap};
 
 use crate::{
     compiler::{Compiler, JITFunc},
@@ -51,13 +48,13 @@ impl Value {
 }
 
 impl<'a> Runtime<'a> {
-    pub fn init(modules: WasmModule<'a>) -> Result<Runtime<'a>> {
+    pub fn init(modules: WasmModule<'a>) -> Runtime<'a> {
         let store = Store::new(modules);
-        Ok(Runtime {
+        Runtime {
             store,
             func_cache: HashMap::new(),
-            compiler: unsafe { Compiler::new()? },
-        })
+            compiler: unsafe { Compiler::new() },
+        }
     }
 
     pub fn call_func_by_name(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
@@ -91,9 +88,6 @@ impl<'a> Runtime<'a> {
             let error = result.add(1) as *const anyhow::Error;
             if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
                 bail!(runtime_error.clone());
-            }
-            if let Some(error) = (*error).downcast_ref::<LayoutError>() {
-                bail!(error.clone());
             }
             bail!("Something went wrong");
         }

@@ -30,8 +30,8 @@ fn dealloc_u64_array(ptr: *mut u64, size: usize) {
 }
 
 impl Compiler {
-    pub(crate) unsafe fn new() -> Result<Compiler, LayoutError> {
-        let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE)?;
+    pub(crate) unsafe fn new() -> Compiler {
+        let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE).unwrap();
         let p_start = alloc(layout);
         let r = mprotect(
             p_start as *const c_void,
@@ -39,15 +39,15 @@ impl Compiler {
             PROT_READ | PROT_WRITE | PROT_EXEC,
         );
         assert!(r == 0);
-        Ok(Compiler {
+        Compiler {
             p_start,
             p_current: p_start,
             p_func_start: p_start,
-        })
+        }
     }
 
-    pub(crate) unsafe fn free(&self) -> Result<(), LayoutError> {
-        let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE)?;
+    pub(crate) unsafe fn free(&self) {
+        let layout = Layout::from_size_align(CODE_AREA_SIZE, PAGE_SIZE).unwrap();
         let r = mprotect(
             self.p_start as *const c_void,
             CODE_AREA_SIZE,
@@ -55,7 +55,6 @@ impl Compiler {
         );
         assert!(r == 0);
         dealloc(self.p_start, layout);
-        Ok(())
     }
 
     unsafe fn push_code(&mut self, code: &[u8]) {
