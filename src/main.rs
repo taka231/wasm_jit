@@ -5,11 +5,10 @@ use wasm_jit::{
 };
 
 fn main() -> Result<()> {
-    let bytes = include_bytes!("../tests/wasm/call.wasm");
+    let bytes = include_bytes!("../tests/wasm/fib.wasm");
     let modules = parser::parse(bytes)?;
-    println!("{:?}", modules);
     let mut runtime = Runtime::init(modules);
-    let result = runtime.call_func_by_name("_start", &[])?;
+    let result = runtime.call_func_by_name("fib", &[Value::I64(10)])?;
     println!("{:?}", result);
 
     Ok(())

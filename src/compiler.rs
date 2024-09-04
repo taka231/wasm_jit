@@ -1,8 +1,11 @@
-use crate::assembler::{ret, Add, Addressing, Call, Mov, Pop, Push, Register32::*, Register64::*};
+use crate::assembler::{
+    ret, Add, Addressing, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
+    Register8::*, Sete, Sub,
+};
 use anyhow::Result;
 use libc::{c_int, c_void, size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
-use wasmparser::Operator;
+use wasmparser::{BlockType, Operator};
 
 use crate::runtime::{store::Store, Runtime};
 
@@ -14,6 +17,20 @@ pub struct Compiler {
     pub p_start: *mut u8,
     pub p_current: *mut u8,
     pub p_func_start: *mut u8,
+}
+
+enum Label {
+    FuncEnd(Vec<*mut u8>),
+    LoopStart {
+        start: *mut u8,
+        start_offset: usize,
+        block_type: BlockType,
+    },
+    End {
+        address_reserved: Vec<*mut u8>,
+        start_offset: usize,
+        block_type: BlockType,
+    },
 }
 
 const CODE_AREA_SIZE: usize = 1024;
@@ -73,11 +90,24 @@ impl Compiler {
         }
     }
 
+    unsafe fn write_i32(pointer: *mut u8, value: i32) {
+        let bytes = value.to_le_bytes();
+        for (i, byte) in bytes.iter().enumerate() {
+            *pointer.add(i) = *byte;
+        }
+    }
+
     fn local_offset(local_index: u32) -> u32 {
         24 + local_index * 8
     }
 
-    unsafe fn compile(&mut self, instrs: &[Operator<'_>], store: &Store<'_>) -> Result<()> {
+    unsafe fn compile(
+        &mut self,
+        instrs: &[Operator<'_>],
+        store: &Store<'_>,
+        stack_count: &mut usize,
+        labels: &mut Vec<Label>,
+    ) -> Result<()> {
         for instr in instrs {
             match instr {
                 Operator::Call { function_index } => {
@@ -86,7 +116,7 @@ impl Compiler {
 
                     code! {self;
                         Edi.mov(args_num),
-                        R10.mov(alloc_u64_array as i64),
+                        R10.mov(alloc_u64_array as usize as i64),
                         R10.call()
                     };
                     for i in (0..args_num).rev() {
@@ -96,16 +126,31 @@ impl Compiler {
                             Rax.with_offset(offset).mov(Rdi)
                         };
                     }
+                    *stack_count -= args_num as usize;
+                    let is_16_byte_aligned = *stack_count % 2 == 0;
+                    if !is_16_byte_aligned {
+                        code! {self;
+                            Rsp.add(-8)
+                        };
+                    }
                     code! {self;
                         Rdi.mov(Rbp.with_offset(-16)),
                         Esi.mov(*function_index as i32),
                         Rdx.mov(Rbp.with_offset(-8)),
                         Ecx.mov(args_num),
                         R8.mov(Rax),
-                        R10.mov(Runtime::call_func_internal as i64),
-                        R10.call(),
-                        Rax.with_offset(8).push()
+                        R10.mov(Runtime::call_func_internal as usize as i64),
+                        R10.call()
                     };
+                    if !is_16_byte_aligned {
+                        code! {self;
+                            Rsp.add(8)
+                        };
+                    }
+                    code! {self;
+                        Rax.with_offset(8).push()
+                    }
+                    *stack_count += 1;
                 }
                 Operator::LocalGet { local_index } => {
                     let offset = Compiler::local_offset(*local_index) as i32;
@@ -113,6 +158,7 @@ impl Compiler {
                         Rax.mov(Rbp.with_offset(-offset)),
                         Rax.push()
                     };
+                    *stack_count += 1;
                 }
                 Operator::I32Const { value } => self.push_code(&value.push()),
                 Operator::I64Const { value } => {
@@ -125,6 +171,7 @@ impl Compiler {
                             Rax.push()
                         };
                     }
+                    *stack_count += 1;
                 }
                 Operator::I32Add | Operator::I64Add => {
                     code! {self;
@@ -137,8 +184,121 @@ impl Compiler {
                         },
                         Rax.push()
                     };
+                    *stack_count -= 1;
                 }
-                Operator::End => {}
+                Operator::I32Sub | Operator::I64Sub => {
+                    code! {self;
+                        Rdi.pop(),
+                        Rax.pop(),
+                        if instr == &Operator::I32Sub {
+                            Eax.sub(Edi)
+                        } else {
+                            Rax.sub(Rdi)
+                        },
+                        Rax.push()
+                    };
+                    *stack_count -= 1;
+                }
+                Operator::I32Eq | Operator::I64Eq => {
+                    code! {self;
+                        Rdi.pop(),
+                        Rax.pop(),
+                        if instr == &Operator::I32Eq {
+                            Eax.cmp(Edi)
+                        } else {
+                            Rax.cmp(Rdi)
+                        },
+                        Al.sete(),
+                        Eax.movzx(Al),
+                        Rax.push()
+                    };
+                    *stack_count -= 1;
+                }
+                Operator::If { blockty } => {
+                    code! {self;
+                        Rax.pop(),
+                        Rdi.mov(0),
+                        Rax.cmp(Rdi),
+                        0_i32.je()
+                    };
+                    let params_len = match blockty {
+                        BlockType::FuncType(n) => {
+                            let func_type = store.get_func_type(*n)?;
+                            func_type.params().len()
+                        }
+                        _ => 0,
+                    };
+                    *stack_count -= 1;
+                    labels.push(Label::End {
+                        address_reserved: vec![self.p_current],
+                        start_offset: *stack_count - params_len,
+                        block_type: *blockty,
+                    });
+                }
+                Operator::Else => {
+                    let label = labels.last_mut().unwrap();
+                    let Label::End {
+                        address_reserved, ..
+                    } = label
+                    else {
+                        unreachable!()
+                    };
+                    code! {self;
+                        0_i32.jmp()
+                    };
+                    address_reserved.push(self.p_current);
+                    let if_start = address_reserved[0];
+                    address_reserved.remove(0);
+                    let relative_offset = self.p_current as usize - if_start as usize;
+                    Compiler::write_i32(if_start.sub(4), relative_offset as i32);
+                }
+                Operator::End => {
+                    let label = labels.pop().unwrap();
+                    match label {
+                        Label::End {
+                            address_reserved,
+                            start_offset,
+                            block_type,
+                        } => {
+                            for address in address_reserved {
+                                let relative_offset = self.p_current as usize - address as usize;
+                                Compiler::write_i32(address.sub(4), relative_offset as i32);
+                            }
+                            let result_len = match block_type {
+                                BlockType::FuncType(n) => {
+                                    let func_type = store.get_func_type(n)?;
+                                    func_type.results().len()
+                                }
+                                BlockType::Type(_) => 1,
+                                BlockType::Empty => 0,
+                            };
+                            if result_len == *stack_count - start_offset {
+                                continue;
+                            }
+                            let relation = (*stack_count - start_offset) as i32 * 8;
+                            code! {self;
+                                Rsp.add(relation)
+                            };
+                            for i in (0..result_len).rev() {
+                                code! {self;
+                                    Rsp.with_offset(-relation + i as i32 * 8).push()
+                                }
+                            }
+                            *stack_count = start_offset + result_len;
+                        }
+                        Label::FuncEnd(address_reserved) => {
+                            for address in address_reserved {
+                                let relative_offset = self.p_current as usize - address as usize;
+                                Compiler::write_i32(address.sub(4), relative_offset as i32);
+                            }
+                        }
+                        Label::LoopStart {
+                            start,
+                            start_offset,
+                            block_type,
+                        } => unimplemented!(),
+                    }
+                }
                 _ => unimplemented!("unimplemented instruction: {:?}", instr),
             }
         }
@@ -146,7 +306,8 @@ impl Compiler {
     }
 
     pub(crate) unsafe fn extract_func(&mut self) -> JITFunc {
-        let func = std::mem::transmute::<*mut u8, JITFunc>(self.p_func_start);
+        let func_pointer = self.p_func_start as *const ();
+        let func = std::mem::transmute::<*const (), JITFunc>(func_pointer);
         self.p_func_start = self.p_current;
         func
     }
@@ -154,22 +315,26 @@ impl Compiler {
     pub(crate) unsafe fn compile_func(&mut self, func_index: u32, store: &Store<'_>) -> Result<()> {
         let func = store.get_code(func_index)?;
         let func_type = store.get_func_type_from_func_index(func_index)?;
+        let mut stack_count = 0;
+        let mut labels = vec![Label::FuncEnd(Vec::new())];
         code! {self;
             Rbp.push(),
             Rbp.mov(Rsp),
             Rsi.push(),
             Rdx.push()
         };
+        stack_count += 2;
         for i in 0..func_type.params().len() {
             code! {self;
                 Rax.mov(Rdi.with_offset(i as i32 * 8)),
                 Rax.push()
             };
         }
+        stack_count += func_type.params().len();
         if !func.locals.is_empty() {
             unimplemented!("local variables are not supported yet");
         }
-        self.compile(&func.body, store)?;
+        self.compile(&func.body, store, &mut stack_count, &mut labels)?;
         if func_type.results().len() > 1 {
             unimplemented!("multiple return values are not supported yet");
         }

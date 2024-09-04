@@ -47,6 +47,12 @@ impl<'a> Store<'a> {
         Ok(func_type)
     }
 
+    pub fn get_func_type(&self, index: u32) -> Result<&FuncType> {
+        self.types
+            .get(index as usize)
+            .with_context(|| RuntimeError::FunctionTypeNotFound(index.to_string()))
+    }
+
     pub fn get_code(&self, index: u32) -> Result<&Func<'a>> {
         self.code
             .get(index as usize)
