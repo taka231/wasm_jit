@@ -478,3 +478,15 @@ impl Je for i32 {
         code
     }
 }
+
+pub trait Jmp {
+    fn jmp(self) -> Vec<u8>;
+}
+
+impl Jmp for i32 {
+    fn jmp(self) -> Vec<u8> {
+        let mut code = vec![0xe9];
+        code.extend_from_slice(&self.to_le_bytes());
+        code
+    }
+}

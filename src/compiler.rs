@@ -1,5 +1,5 @@
 use crate::assembler::{
-    ret, Add, Addressing, Call, Cmp, Je, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
+    ret, Add, Addressing, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
     Register8::*, Sete, Sub,
 };
 use anyhow::Result;
@@ -127,6 +127,12 @@ impl Compiler {
                         };
                     }
                     *stack_count -= args_num as usize;
+                    let is_16_byte_aligned = *stack_count % 2 == 0;
+                    if !is_16_byte_aligned {
+                        code! {self;
+                            Rsp.add(-8)
+                        };
+                    }
                     code! {self;
                         Rdi.mov(Rbp.with_offset(-16)),
                         Esi.mov(*function_index as i32),
@@ -134,9 +140,16 @@ impl Compiler {
                         Ecx.mov(args_num),
                         R8.mov(Rax),
                         R10.mov(Runtime::call_func_internal as usize as i64),
-                        R10.call(),
-                        Rax.with_offset(8).push()
+                        R10.call()
                     };
+                    if !is_16_byte_aligned {
+                        code! {self;
+                            Rsp.add(8)
+                        };
+                    }
+                    code! {self;
+                        Rax.with_offset(8).push()
+                    }
                     *stack_count += 1;
                 }
                 Operator::LocalGet { local_index } => {
@@ -230,6 +243,10 @@ impl Compiler {
                     else {
                         unreachable!()
                     };
+                    code! {self;
+                        0_i32.jmp()
+                    };
+                    address_reserved.push(self.p_current);
                     let if_start = address_reserved[0];
                     address_reserved.remove(0);
                     let relative_offset = self.p_current as usize - if_start as usize;
@@ -267,6 +284,7 @@ impl Compiler {
                                     Rsp.with_offset(-relation + i as i32 * 8).push()
                                 }
                             }
+                            *stack_count = start_offset + result_len;
                         }
                         Label::FuncEnd(address_reserved) => {
                             for address in address_reserved {
