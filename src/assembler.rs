@@ -38,6 +38,18 @@ pub enum Register32 {
     R15d,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Register8 {
+    Al,
+    Cl,
+    Dl,
+    Bl,
+    Ah,
+    Ch,
+    Dh,
+    Bh,
+}
+
 #[derive(Debug, Clone)]
 pub struct Addressing<Reg> {
     pub base: Reg,
@@ -106,8 +118,16 @@ fn sib(scale: u8, index: u8, base: u8) -> u8 {
     ((scale & 3) << 6) | ((index & 7) << 3) | (base & 7)
 }
 
-impl Register64 {
-    pub fn number(&self) -> u8 {
+trait RegisterNumber {
+    fn number(&self) -> u8;
+}
+
+trait RegisterSize {
+    fn size(&self) -> u8;
+}
+
+impl RegisterNumber for Register64 {
+    fn number(&self) -> u8 {
         use Register64::*;
         match self {
             Rax => 0,
@@ -128,7 +148,15 @@ impl Register64 {
             R15 => 15,
         }
     }
+}
 
+impl RegisterSize for Register64 {
+    fn size(&self) -> u8 {
+        8
+    }
+}
+
+impl Register64 {
     pub fn with_offset(self, offset: i32) -> Addressing<Self> {
         Addressing { base: self, offset }
     }
@@ -141,8 +169,8 @@ impl Register64 {
     }
 }
 
-impl Register32 {
-    pub fn number(&self) -> u8 {
+impl RegisterNumber for Register32 {
+    fn number(&self) -> u8 {
         use Register32::*;
         match self {
             Eax => 0,
@@ -162,6 +190,34 @@ impl Register32 {
             R14d => 14,
             R15d => 15,
         }
+    }
+}
+
+impl RegisterSize for Register32 {
+    fn size(&self) -> u8 {
+        4
+    }
+}
+
+impl RegisterNumber for Register8 {
+    fn number(&self) -> u8 {
+        use Register8::*;
+        match self {
+            Al => 0,
+            Cl => 1,
+            Dl => 2,
+            Bl => 3,
+            Ah => 4,
+            Ch => 5,
+            Dh => 6,
+            Bh => 7,
+        }
+    }
+}
+
+impl RegisterSize for Register8 {
+    fn size(&self) -> u8 {
+        1
     }
 }
 
@@ -230,14 +286,7 @@ pub trait Mov<Src> {
 
 impl Mov<Register64> for Register64 {
     fn mov(self, src: Register64) -> Vec<u8> {
-        let mut code = vec![];
-        let dest_number = self.number();
-        let src_number = src.number();
-
-        code.push(rex(true, src_number >= 8, false, dest_number >= 8));
-        code.push(0x89);
-        code.push(mod_rm(3, src_number, dest_number));
-        code
+        opcode_rm_reg(0x89, self, src)
     }
 }
 
@@ -320,30 +369,112 @@ pub fn ret() -> Vec<u8> {
     vec![0xc3]
 }
 
+fn opcode_rm_reg<R>(opcode: u8, dest: R, src: R) -> Vec<u8>
+where
+    R: RegisterNumber + RegisterSize,
+{
+    let mut code = vec![];
+    let dest_number = dest.number();
+    let src_number = src.number();
+    let size = dest.size();
+    code.push(rex(size == 8, src_number >= 8, false, dest_number >= 8));
+    code.push(opcode);
+    code.push(mod_rm(3, src_number, dest_number));
+    code
+}
+
 pub trait Add<Src> {
     fn add(self, src: Src) -> Vec<u8>;
 }
 
 impl Add<Register64> for Register64 {
     fn add(self, src: Register64) -> Vec<u8> {
-        let mut code = vec![];
-        let dest_number = self.number();
-        let src_number = src.number();
-        code.push(rex(true, src_number >= 8, false, dest_number >= 8));
-        code.push(0x01);
-        code.push(mod_rm(3, src_number, dest_number));
-        code
+        opcode_rm_reg(0x01, self, src)
     }
 }
 
 impl Add<Register32> for Register32 {
     fn add(self, src: Register32) -> Vec<u8> {
+        opcode_rm_reg(0x01, self, src)
+    }
+}
+
+impl Add<i32> for Register64 {
+    fn add(self, src: i32) -> Vec<u8> {
         let mut code = vec![];
-        let dest_number = self.number();
-        let src_number = src.number();
-        code.push(rex(false, src_number >= 8, false, dest_number >= 8));
-        code.push(0x01);
-        code.push(mod_rm(3, src_number, dest_number));
+        let number = self.number();
+        code.push(rex(true, false, false, number >= 8));
+        code.push(0x81);
+        code.push(mod_rm(3, 0, number));
+        code.extend_from_slice(&src.to_le_bytes());
+        code
+    }
+}
+
+pub trait Sub<Src> {
+    fn sub(self, src: Src) -> Vec<u8>;
+}
+
+impl Sub<Register64> for Register64 {
+    fn sub(self, src: Register64) -> Vec<u8> {
+        opcode_rm_reg(0x29, self, src)
+    }
+}
+
+impl Sub<Register32> for Register32 {
+    fn sub(self, src: Register32) -> Vec<u8> {
+        opcode_rm_reg(0x29, self, src)
+    }
+}
+
+pub trait Cmp<Src> {
+    fn cmp(self, src: Src) -> Vec<u8>;
+}
+
+impl Cmp<Register64> for Register64 {
+    fn cmp(self, src: Register64) -> Vec<u8> {
+        opcode_rm_reg(0x39, self, src)
+    }
+}
+
+impl Cmp<Register32> for Register32 {
+    fn cmp(self, src: Register32) -> Vec<u8> {
+        opcode_rm_reg(0x39, self, src)
+    }
+}
+
+pub trait Sete {
+    fn sete(self) -> Vec<u8>;
+}
+
+impl Sete for Register8 {
+    fn sete(self) -> Vec<u8> {
+        let mut code = vec![0x0f, 0x94];
+        code.push(0xc0 | self.number());
+        code
+    }
+}
+
+pub trait Movzx<Src> {
+    fn movzx(self, src: Src) -> Vec<u8>;
+}
+
+impl Movzx<Register8> for Register32 {
+    fn movzx(self, src: Register8) -> Vec<u8> {
+        let mut code = vec![0x0f, 0xb6];
+        code.push(mod_rm(3, self.number(), src.number()));
+        code
+    }
+}
+
+pub trait Je {
+    fn je(self) -> Vec<u8>;
+}
+
+impl Je for i32 {
+    fn je(self) -> Vec<u8> {
+        let mut code = vec![0x0f, 0x84];
+        code.extend_from_slice(&self.to_le_bytes());
         code
     }
 }
