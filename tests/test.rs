@@ -50,6 +50,11 @@ fn test_fib() -> Result<()> {
     let mut runtime = Runtime::init(modules);
     let result = runtime.call_func_by_name("fib", &[Value::I64(10)])?;
     assert_eq!(result, vec![Value::I64(55)]);
+    let start = std::time::Instant::now();
+    let result = runtime.call_func_by_name("fib", &[Value::I64(30)])?;
+    let elapsed = start.elapsed();
+    println!("Elapsed: {:?}", elapsed);
+    assert_eq!(result, vec![Value::I64(832040)]);
 
     Ok(())
 }
