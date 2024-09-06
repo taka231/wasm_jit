@@ -14,7 +14,6 @@ use wasmparser::{Export, ExternalKind, ValType};
 
 pub struct Runtime<'a> {
     store: Store<'a>,
-    func_cache: HashMap<u32, JITFunc>,
     compiler: Compiler,
 }
 
@@ -52,7 +51,6 @@ impl<'a> Runtime<'a> {
         let store = Store::new(modules);
         Runtime {
             store,
-            func_cache: HashMap::new(),
             compiler: unsafe { Compiler::new() },
         }
     }
@@ -73,12 +71,11 @@ impl<'a> Runtime<'a> {
     }
 
     unsafe fn call_func_by_index(&mut self, index: u32, args: &mut [u64]) -> Result<Vec<u64>> {
-        let code: JITFunc = if let Some(code) = self.func_cache.get(&index) {
-            *code
+        let code: JITFunc = if let Some(code) = self.compiler.func_cache.get(&index) {
+            std::mem::transmute::<*const (), JITFunc>(*code)
         } else {
             self.compiler.compile_func(index, &self.store)?;
-            let code = self.compiler.extract_func();
-            self.func_cache.insert(index, code);
+            let code = self.compiler.extract_func(index);
             code
         };
         let args = args.as_mut_ptr();

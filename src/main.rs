@@ -10,6 +10,10 @@ fn main() -> Result<()> {
     let mut runtime = Runtime::init(modules);
     let result = runtime.call_func_by_name("fib", &[Value::I64(10)])?;
     println!("{:?}", result);
+    let start = std::time::Instant::now();
+    let result = runtime.call_func_by_name("fib", &[Value::I64(30)])?;
+    println!("Elapsed: {:?}", start.elapsed());
+    println!("{:?}", result);
 
     Ok(())
 }

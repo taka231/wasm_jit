@@ -1,10 +1,16 @@
-use crate::assembler::{
-    ret, Add, Addressing, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
-    Register8::*, Sete, Sub,
+use crate::{
+    assembler::{
+        ret, Add, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
+        Register8::*, Sete, Sub,
+    },
+    wasm::Func,
 };
 use anyhow::Result;
 use libc::{c_int, c_void, size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
-use std::alloc::{alloc, dealloc, Layout, LayoutError};
+use std::{
+    alloc::{alloc, dealloc, Layout},
+    collections::HashMap,
+};
 use wasmparser::{BlockType, Operator};
 
 use crate::runtime::{store::Store, Runtime};
@@ -17,6 +23,7 @@ pub struct Compiler {
     pub p_start: *mut u8,
     pub p_current: *mut u8,
     pub p_func_start: *mut u8,
+    pub func_cache: HashMap<u32, *const ()>,
 }
 
 enum Label {
@@ -69,6 +76,7 @@ impl Compiler {
             p_start,
             p_current: p_start,
             p_func_start: p_start,
+            func_cache: HashMap::new(),
         }
     }
 
@@ -98,27 +106,37 @@ impl Compiler {
     }
 
     fn local_offset(local_index: u32) -> u32 {
-        24 + local_index * 8
+        8 * (Self::ARGS_NUM + 1) + local_index * 8
     }
+
+    const ARGS_NUM: u32 = 3;
 
     unsafe fn compile(
         &mut self,
-        instrs: &[Operator<'_>],
+        func: &Func<'_>,
+        func_index: u32,
         store: &Store<'_>,
         stack_count: &mut usize,
         labels: &mut Vec<Label>,
     ) -> Result<()> {
-        for instr in instrs {
+        for instr in &func.body {
             match instr {
                 Operator::Call { function_index } => {
                     let func_type = store.get_func_type_from_func_index(*function_index)?;
                     let args_num = func_type.params().len() as i32;
 
-                    code! {self;
-                        Edi.mov(args_num),
-                        R10.mov(alloc_u64_array as usize as i64),
-                        R10.call()
-                    };
+                    if *function_index == func_index {
+                        code! {self;
+                            Rax.mov(Rbp.with_offset(-24))
+                        }
+                    } else {
+                        code! {self;
+                            Edi.mov(args_num),
+                            R10.mov(alloc_u64_array as usize as i64),
+                            R10.call()
+                        };
+                    }
+
                     for i in (0..args_num).rev() {
                         let offset = 8 * i;
                         code! {self;
@@ -133,21 +151,32 @@ impl Compiler {
                             Rsp.add(-8)
                         };
                     }
-                    code! {self;
-                        Rdi.mov(Rbp.with_offset(-16)),
-                        Esi.mov(*function_index as i32),
-                        Rdx.mov(Rbp.with_offset(-8)),
-                        Ecx.mov(args_num),
-                        R8.mov(Rax),
-                        R10.mov(Runtime::call_func_internal as usize as i64),
-                        R10.call()
-                    };
+                    if *function_index == func_index {
+                        code! {self;
+                            Rdi.mov(Rax),
+                            Rsi.mov(Rbp.with_offset(-8)),
+                            Rdx.mov(Rbp.with_offset(-16)),
+                            R10.mov(self.p_func_start as usize as i64),
+                            R10.call()
+                        }
+                    } else {
+                        code! {self;
+                            Rdi.mov(Rbp.with_offset(-16)),
+                            Esi.mov(*function_index as i32),
+                            Rdx.mov(Rbp.with_offset(-8)),
+                            Ecx.mov(args_num),
+                            R8.mov(Rax),
+                            R10.mov(Runtime::call_func_internal as usize as i64),
+                            R10.call()
+                        };
+                    }
                     if !is_16_byte_aligned {
                         code! {self;
                             Rsp.add(8)
                         };
                     }
                     code! {self;
+                        Rax.mov(Rbp.with_offset(-8)),
                         Rax.with_offset(8).push()
                     }
                     *stack_count += 1;
@@ -305,8 +334,9 @@ impl Compiler {
         Ok(())
     }
 
-    pub(crate) unsafe fn extract_func(&mut self) -> JITFunc {
+    pub(crate) unsafe fn extract_func(&mut self, index: u32) -> JITFunc {
         let func_pointer = self.p_func_start as *const ();
+        self.func_cache.insert(index, func_pointer);
         let func = std::mem::transmute::<*const (), JITFunc>(func_pointer);
         self.p_func_start = self.p_current;
         func
@@ -321,9 +351,10 @@ impl Compiler {
             Rbp.push(),
             Rbp.mov(Rsp),
             Rsi.push(),
-            Rdx.push()
+            Rdx.push(),
+            Rdi.push()
         };
-        stack_count += 2;
+        stack_count += Self::ARGS_NUM as usize;
         for i in 0..func_type.params().len() {
             code! {self;
                 Rax.mov(Rdi.with_offset(i as i32 * 8)),
@@ -334,7 +365,7 @@ impl Compiler {
         if !func.locals.is_empty() {
             unimplemented!("local variables are not supported yet");
         }
-        self.compile(&func.body, store, &mut stack_count, &mut labels)?;
+        self.compile(func, func_index, store, &mut stack_count, &mut labels)?;
         if func_type.results().len() > 1 {
             unimplemented!("multiple return values are not supported yet");
         }
