@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Register64 {
     Rax,
     Rcx,
@@ -18,7 +18,7 @@ pub enum Register64 {
     R15,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Register32 {
     Eax,
     Ecx,
@@ -38,7 +38,7 @@ pub enum Register32 {
     R15d,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Register8 {
     Al,
     Cl,

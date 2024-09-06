@@ -78,9 +78,39 @@ impl<'a> Runtime<'a> {
             let code = self.compiler.extract_func(index);
             code
         };
-        let args = args.as_mut_ptr();
         let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
-        code(args, result, self);
+        // JITコンパイルされた関数には引数を逆順で渡す
+        args.reverse();
+        match args.len() {
+            0 => code(result, self),
+            1 => code(result, self, args[0]),
+            2 => code(result, self, args[0], args[1]),
+            3 => code(result, self, args[0], args[1], args[2]),
+            4 => code(result, self, args[0], args[1], args[2], args[3]),
+            5 => code(result, self, args[0], args[1], args[2], args[3], args[4]),
+            6 => code(
+                result, self, args[0], args[1], args[2], args[3], args[4], args[5],
+            ),
+            7 => code(
+                result, self, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+            ),
+            8 => code(
+                result, self, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                args[7],
+            ),
+            9 => code(
+                result, self, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                args[7], args[8],
+            ),
+            10 => code(
+                result, self, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                args[7], args[8], args[9],
+            ),
+            _ => {
+                let args = args.as_ptr();
+                code(result, self, args);
+            }
+        }
         if *result != 0 {
             let error = result.add(1) as *const anyhow::Error;
             if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
@@ -102,6 +132,8 @@ impl<'a> Runtime<'a> {
         args: *mut u64,
     ) -> *mut u64 {
         let args_slice = std::slice::from_raw_parts_mut(args, args_num as usize);
+        // JITコンパイルされた関数からは引数が逆順になって呼ばれるので、元に戻す
+        args_slice.reverse();
         let result = self.call_func_by_index(index, args_slice);
         std::alloc::dealloc(
             args as *mut u8,

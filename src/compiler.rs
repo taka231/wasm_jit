@@ -42,7 +42,8 @@ enum Label {
 
 const CODE_AREA_SIZE: usize = 1024;
 const PAGE_SIZE: usize = 4096;
-pub type JITFunc = fn(args: *mut u64, result: *mut u64, runtime: &mut Runtime) -> ();
+// 引数はwasmと反対の順番で渡す
+pub type JITFunc = extern "C" fn(result: *mut u64, runtime: &mut Runtime, args: ...) -> ();
 
 fn alloc_u64_array(size: usize) -> *mut u64 {
     let layout = Layout::from_size_align(size * std::mem::size_of::<u64>(), 8).unwrap();
@@ -56,6 +57,11 @@ fn dealloc_u64_array(ptr: *mut u64, size: usize) {
 
 macro_rules! code {
     {$self:expr; $($code:expr),+} => {
+        for code in &[$($code),+] {
+            $self.push_code(&code);
+        }
+    };
+    {$self:expr; $($code:expr),+,} => {
         for code in &[$($code),+] {
             $self.push_code(&code);
         }
@@ -109,7 +115,7 @@ impl Compiler {
         8 * (Self::ARGS_NUM + 1) + local_index * 8
     }
 
-    const ARGS_NUM: u32 = 3;
+    const ARGS_NUM: u32 = 2;
 
     unsafe fn compile(
         &mut self,
@@ -125,9 +131,24 @@ impl Compiler {
                     let func_type = store.get_func_type_from_func_index(*function_index)?;
                     let args_num = func_type.params().len() as i32;
 
-                    if *function_index == func_index {
+                    if args_num <= 10 && *function_index == func_index {
                         code! {self;
-                            Rax.mov(Rbp.with_offset(-24))
+                            Rdi.mov(Rbp.with_offset(-8)),
+                            Rsi.mov(Rbp.with_offset(-16)),
+                        };
+                        for i in 0..4.min(args_num) {
+                            let args = [Rdx, Rcx, R8, R9];
+                            code! {self;
+                                Rax.pop(),
+                                args[i as usize].mov(Rax)
+                            }
+                        }
+                        *stack_count -= args_num as usize;
+                        let is_16_byte_aligned = *stack_count % 2 == 0;
+                        if !is_16_byte_aligned {
+                            code! {self;
+                                Rsp.add(-8)
+                            };
                         }
                     } else {
                         code! {self;
@@ -135,51 +156,51 @@ impl Compiler {
                             R10.mov(alloc_u64_array as usize as i64),
                             R10.call()
                         };
-                    }
 
-                    for i in (0..args_num).rev() {
-                        let offset = 8 * i;
-                        code! {self;
-                            Rdi.pop(),
-                            Rax.with_offset(offset).mov(Rdi)
-                        };
-                    }
-                    *stack_count -= args_num as usize;
-                    let is_16_byte_aligned = *stack_count % 2 == 0;
-                    if !is_16_byte_aligned {
-                        code! {self;
-                            Rsp.add(-8)
-                        };
-                    }
-                    if *function_index == func_index {
-                        code! {self;
-                            Rdi.mov(Rax),
-                            Rsi.mov(Rbp.with_offset(-8)),
-                            Rdx.mov(Rbp.with_offset(-16)),
-                            R10.mov(self.p_func_start as usize as i64),
-                            R10.call()
+                        for i in 0..args_num {
+                            let offset = 8 * i;
+                            code! {self;
+                                Rdi.pop(),
+                                Rax.with_offset(offset).mov(Rdi)
+                            };
                         }
-                    } else {
+                        *stack_count -= args_num as usize;
+                        let is_16_byte_aligned = *stack_count % 2 == 0;
+                        if !is_16_byte_aligned {
+                            code! {self;
+                                Rsp.add(-8)
+                            };
+                        }
+                        if *function_index == func_index {
+                            code! {self;
+                                Rdi.mov(Rbp.with_offset(-8)),
+                                Rsi.mov(Rbp.with_offset(-16)),
+                                Rdx.mov(Rax),
+                                R10.mov(self.p_func_start as usize as i64),
+                                R10.call()
+                            }
+                        } else {
+                            code! {self;
+                                Rdi.mov(Rbp.with_offset(-16)),
+                                Esi.mov(*function_index as i32),
+                                Rdx.mov(Rbp.with_offset(-8)),
+                                Ecx.mov(args_num),
+                                R8.mov(Rax),
+                                R10.mov(Runtime::call_func_internal as usize as i64),
+                                R10.call()
+                            };
+                        }
+                        if !is_16_byte_aligned {
+                            code! {self;
+                                Rsp.add(8)
+                            };
+                        }
                         code! {self;
-                            Rdi.mov(Rbp.with_offset(-16)),
-                            Esi.mov(*function_index as i32),
-                            Rdx.mov(Rbp.with_offset(-8)),
-                            Ecx.mov(args_num),
-                            R8.mov(Rax),
-                            R10.mov(Runtime::call_func_internal as usize as i64),
-                            R10.call()
-                        };
+                            Rax.mov(Rbp.with_offset(-8)),
+                            Rax.with_offset(8).push()
+                        }
+                        *stack_count += 1;
                     }
-                    if !is_16_byte_aligned {
-                        code! {self;
-                            Rsp.add(8)
-                        };
-                    }
-                    code! {self;
-                        Rax.mov(Rbp.with_offset(-8)),
-                        Rax.with_offset(8).push()
-                    }
-                    *stack_count += 1;
                 }
                 Operator::LocalGet { local_index } => {
                     let offset = Compiler::local_offset(*local_index) as i32;
@@ -350,16 +371,32 @@ impl Compiler {
         code! {self;
             Rbp.push(),
             Rbp.mov(Rsp),
-            Rsi.push(),
-            Rdx.push(),
-            Rdi.push()
+            Rdi.push(),
+            Rsi.push()
         };
         stack_count += Self::ARGS_NUM as usize;
-        for i in 0..func_type.params().len() {
-            code! {self;
-                Rax.mov(Rdi.with_offset(i as i32 * 8)),
-                Rax.push()
-            };
+        let params_len = func_type.params().len();
+        if params_len <= 10 {
+            for i in 0..4.min(params_len) {
+                let args = [Rdx, Rcx, R8, R9];
+                code! {self;
+                    args[i].push()
+                }
+            }
+            for i in 4..params_len {
+                let arg_offset = 16 + (i - 4) * 8;
+                code! {self;
+                    Rax.mov(Rbp.with_offset(arg_offset as i32)),
+                    Rax.push()
+                }
+            }
+        } else {
+            for i in (0..func_type.params().len()).rev() {
+                code! {self;
+                    Rax.mov(Rdx.with_offset(i as i32 * 8)),
+                    Rax.push()
+                };
+            }
         }
         stack_count += func_type.params().len();
         if !func.locals.is_empty() {
