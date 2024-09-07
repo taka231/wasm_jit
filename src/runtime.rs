@@ -1,7 +1,11 @@
 pub mod error;
 pub mod store;
 
-use std::{alloc::Layout, collections::HashMap};
+use std::{
+    alloc::Layout,
+    collections::HashMap,
+    ffi::{c_int, c_void},
+};
 
 use crate::{
     compiler::{Compiler, JITFunc},
@@ -9,12 +13,14 @@ use crate::{
 };
 use anyhow::{bail, Error, Result};
 use error::RuntimeError;
+use libc::size_t;
 use store::Store;
 use wasmparser::{Export, ExternalKind, ValType};
 
 pub struct Runtime<'a> {
     store: Store<'a>,
     compiler: Compiler,
+    stack_base: *mut u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,12 +52,29 @@ impl Value {
     }
 }
 
+const PAGE_SIZE: usize = 4096;
+const STACK_SIZE: usize = PAGE_SIZE * 1;
+
+extern "C" {
+    fn mprotect(addr: *const c_void, len: size_t, prot: c_int) -> c_int;
+}
+
 impl<'a> Runtime<'a> {
     pub fn init(modules: WasmModule<'a>) -> Runtime<'a> {
         let store = Store::new(modules);
+        let stack_layout = Layout::from_size_align(STACK_SIZE + PAGE_SIZE, 8).unwrap();
+        let sp = unsafe { std::alloc::alloc(stack_layout) as *mut u64 };
+        unsafe {
+            mprotect(
+                sp.add(STACK_SIZE) as *const c_void,
+                PAGE_SIZE,
+                libc::PROT_NONE,
+            );
+        }
         Runtime {
             store,
             compiler: unsafe { Compiler::new() },
+            stack_base: sp,
         }
     }
 
@@ -61,16 +84,27 @@ impl<'a> Runtime<'a> {
         if *kind != ExternalKind::Func {
             bail!("Export kind is not a function: {}", name);
         }
-        let mut args = args.iter().map(|arg| arg.to_u64()).collect::<Vec<u64>>();
+        for (i, arg) in args.iter().enumerate() {
+            unsafe {
+                *self.stack_base.add(i) = arg.to_u64();
+            }
+        }
         unsafe {
-            let result = self.call_func_by_index(index, &mut args)?;
+            self.call_func_by_index(self.stack_base.add(args.len()), index)?;
             let func_type = self.store.get_func_type_from_func_index(index)?;
+            let mut result = Vec::new();
+            for i in 0..func_type.results().len() {
+                result.push(Value::from_u64(
+                    *self.stack_base.add(i),
+                    &func_type.results()[i],
+                ));
+            }
 
-            Ok(vec![Value::from_u64(result[0], &func_type.results()[0])])
+            Ok(result)
         }
     }
 
-    unsafe fn call_func_by_index(&mut self, index: u32, args: &mut [u64]) -> Result<Vec<u64>> {
+    unsafe fn call_func_by_index(&mut self, sp: *mut u64, index: u32) -> Result<()> {
         let code: JITFunc = if let Some(code) = self.compiler.func_cache.get(&index) {
             std::mem::transmute::<*const (), JITFunc>(*code)
         } else {
@@ -78,47 +112,19 @@ impl<'a> Runtime<'a> {
             let code = self.compiler.extract_func(index);
             code
         };
-        let args = args.as_mut_ptr();
-        let result = std::alloc::alloc(Layout::from_size_align(16, 8)?) as *mut u64;
-        code(args, result, self);
-        if *result != 0 {
-            let error = result.add(1) as *const anyhow::Error;
-            if let Some(runtime_error) = (*error).downcast_ref::<RuntimeError>() {
-                bail!(runtime_error.clone());
-            }
-            bail!("Something went wrong");
+        let result = code(self, sp);
+        if result != 0 {
+            let error = std::mem::transmute::<u64, Error>(result);
+            return Err(error);
         }
-        let value = *result.add(1);
-        std::alloc::dealloc(result as *mut u8, Layout::from_size_align(16, 8)?);
-
-        Ok(vec![value])
+        Ok(())
     }
 
-    pub(crate) unsafe fn call_func_internal(
-        &mut self,
-        index: u32,
-        result_ptr: *mut u64,
-        args_num: u32,
-        args: *mut u64,
-    ) -> *mut u64 {
-        let args_slice = std::slice::from_raw_parts_mut(args, args_num as usize);
-        let result = self.call_func_by_index(index, args_slice);
-        std::alloc::dealloc(
-            args as *mut u8,
-            Layout::from_size_align(8 * args_num as usize, 8).unwrap(),
-        );
+    pub(crate) unsafe fn call_func_internal(&mut self, sp: *mut u64, index: u32) -> u64 {
+        let result = self.call_func_by_index(sp, index);
         match result {
-            Ok(result) => {
-                *result_ptr = 0;
-                *(result_ptr.add(1)) = result[0];
-            }
-            Err(err) => {
-                *result_ptr = 1;
-                assert!(std::mem::size_of::<Error>() <= 8);
-                let error_ptr = result_ptr.add(1) as *mut Error;
-                *error_ptr = err;
-            }
+            Ok(_) => 0,
+            Err(err) => std::mem::transmute::<Error, u64>(err),
         }
-        result_ptr
     }
 }

@@ -1,7 +1,10 @@
 use crate::{
     assembler::{
-        ret, Add, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push, Register32::*, Register64::*,
-        Register8::*, Sete, Sub,
+        ret, Add, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push,
+        Register32::*,
+        Register64::{self, *},
+        Register8::*,
+        Sete, Sub,
     },
     wasm::Func,
 };
@@ -42,17 +45,7 @@ enum Label {
 
 const CODE_AREA_SIZE: usize = 1024;
 const PAGE_SIZE: usize = 4096;
-pub type JITFunc = fn(args: *mut u64, result: *mut u64, runtime: &mut Runtime) -> ();
-
-fn alloc_u64_array(size: usize) -> *mut u64 {
-    let layout = Layout::from_size_align(size * std::mem::size_of::<u64>(), 8).unwrap();
-    unsafe { alloc(layout) as *mut u64 }
-}
-
-fn dealloc_u64_array(ptr: *mut u64, size: usize) {
-    let layout = Layout::from_size_align(size * std::mem::size_of::<u64>(), 8).unwrap();
-    unsafe { dealloc(ptr as *mut u8, layout) }
-}
+pub type JITFunc = fn(runtime: &mut Runtime, sp: *mut u64) -> u64;
 
 macro_rules! code {
     {$self:expr; $($code:expr),+} => {
@@ -105,11 +98,25 @@ impl Compiler {
         }
     }
 
-    fn local_offset(local_index: u32) -> u32 {
-        8 * (Self::ARGS_NUM + 1) + local_index * 8
+    unsafe fn push_data(data: Register64) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&R11.to_mem().mov(data));
+        code.extend_from_slice(&R11.add(8));
+        code
     }
 
-    const ARGS_NUM: u32 = 3;
+    unsafe fn pop_data(data: Register64) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&R11.add(-8));
+        code.extend_from_slice(&data.mov(R11.to_mem()));
+        code
+    }
+
+    fn local_offset(local_index: u32) -> u32 {
+        8 * (Self::LOCAL_BASE_COUNT + 1) + local_index * 8
+    }
+
+    const LOCAL_BASE_COUNT: u32 = 1;
 
     unsafe fn compile(
         &mut self,
@@ -125,113 +132,79 @@ impl Compiler {
                     let func_type = store.get_func_type_from_func_index(*function_index)?;
                     let args_num = func_type.params().len() as i32;
 
-                    if *function_index == func_index {
-                        code! {self;
-                            Rax.mov(Rbp.with_offset(-24))
-                        }
-                    } else {
-                        code! {self;
-                            Edi.mov(args_num),
-                            R10.mov(alloc_u64_array as usize as i64),
-                            R10.call()
-                        };
+                    code! {self;
+                        Rdi.mov(Rbp.with_offset(-8)),
+                        Rsi.mov(R11),
+                        Edx.mov(*function_index as i32),
+                        if *function_index == func_index {
+                            R10.mov(self.p_func_start as usize as i64)
+                        } else {
+                            R10.mov(Runtime::call_func_internal as usize as i64)
+                        },
+                        R11.push(),
+                        R10.call()
                     }
 
-                    for i in (0..args_num).rev() {
-                        let offset = 8 * i;
-                        code! {self;
-                            Rdi.pop(),
-                            Rax.with_offset(offset).mov(Rdi)
-                        };
-                    }
                     *stack_count -= args_num as usize;
-                    let is_16_byte_aligned = *stack_count % 2 == 0;
-                    if !is_16_byte_aligned {
-                        code! {self;
-                            Rsp.add(-8)
-                        };
-                    }
-                    if *function_index == func_index {
-                        code! {self;
-                            Rdi.mov(Rax),
-                            Rsi.mov(Rbp.with_offset(-8)),
-                            Rdx.mov(Rbp.with_offset(-16)),
-                            R10.mov(self.p_func_start as usize as i64),
-                            R10.call()
-                        }
-                    } else {
-                        code! {self;
-                            Rdi.mov(Rbp.with_offset(-16)),
-                            Esi.mov(*function_index as i32),
-                            Rdx.mov(Rbp.with_offset(-8)),
-                            Ecx.mov(args_num),
-                            R8.mov(Rax),
-                            R10.mov(Runtime::call_func_internal as usize as i64),
-                            R10.call()
-                        };
-                    }
-                    if !is_16_byte_aligned {
-                        code! {self;
-                            Rsp.add(8)
-                        };
-                    }
+
                     code! {self;
-                        Rax.mov(Rbp.with_offset(-8)),
-                        Rax.with_offset(8).push()
+                        R11.pop(),
+                        R11.add(8 * (func_type.results().len() as i32 - args_num))
                     }
-                    *stack_count += 1;
+                    *stack_count += func_type.results().len();
                 }
                 Operator::LocalGet { local_index } => {
                     let offset = Compiler::local_offset(*local_index) as i32;
                     code! {self;
                         Rax.mov(Rbp.with_offset(-offset)),
-                        Rax.push()
+                        Self::push_data(Rax)
                     };
                     *stack_count += 1;
                 }
-                Operator::I32Const { value } => self.push_code(&value.push()),
+                Operator::I32Const { value } => {
+                    code! {self;
+                        Eax.mov(*value),
+                        Self::push_data(Rax)
+                    };
+                    *stack_count += 1;
+                }
                 Operator::I64Const { value } => {
-                    if i32::MIN as i64 <= *value && *value <= i32::MAX as i64 {
-                        let value = *value as i32;
-                        self.push_code(&value.push());
-                    } else {
-                        code! {self;
-                            Rax.mov(*value),
-                            Rax.push()
-                        };
-                    }
+                    code! {self;
+                        Rax.mov(*value),
+                        Self::push_data(Rax)
+                    };
                     *stack_count += 1;
                 }
                 Operator::I32Add | Operator::I64Add => {
                     code! {self;
-                        Rdi.pop(),
-                        Rax.pop(),
+                        Self::pop_data(Rdi),
+                        Self::pop_data(Rax),
                         if instr == &Operator::I32Add {
                             Eax.add(Edi)
                         } else {
                             Rax.add(Rdi)
                         },
-                        Rax.push()
+                        Self::push_data(Rax)
                     };
                     *stack_count -= 1;
                 }
                 Operator::I32Sub | Operator::I64Sub => {
                     code! {self;
-                        Rdi.pop(),
-                        Rax.pop(),
+                        Self::pop_data(Rdi),
+                        Self::pop_data(Rax),
                         if instr == &Operator::I32Sub {
                             Eax.sub(Edi)
                         } else {
                             Rax.sub(Rdi)
                         },
-                        Rax.push()
+                        Self::push_data(Rax)
                     };
                     *stack_count -= 1;
                 }
                 Operator::I32Eq | Operator::I64Eq => {
                     code! {self;
-                        Rdi.pop(),
-                        Rax.pop(),
+                        Self::pop_data(Rdi),
+                        Self::pop_data(Rax),
                         if instr == &Operator::I32Eq {
                             Eax.cmp(Edi)
                         } else {
@@ -239,13 +212,13 @@ impl Compiler {
                         },
                         Al.sete(),
                         Eax.movzx(Al),
-                        Rax.push()
+                        Self::push_data(Rax)
                     };
                     *stack_count -= 1;
                 }
                 Operator::If { blockty } => {
                     code! {self;
-                        Rax.pop(),
+                        Self::pop_data(Rax),
                         Rdi.mov(0),
                         Rax.cmp(Rdi),
                         0_i32.je()
@@ -267,7 +240,9 @@ impl Compiler {
                 Operator::Else => {
                     let label = labels.last_mut().unwrap();
                     let Label::End {
-                        address_reserved, ..
+                        address_reserved,
+                        start_offset,
+                        ..
                     } = label
                     else {
                         unreachable!()
@@ -280,6 +255,7 @@ impl Compiler {
                     address_reserved.remove(0);
                     let relative_offset = self.p_current as usize - if_start as usize;
                     Compiler::write_i32(if_start.sub(4), relative_offset as i32);
+                    *stack_count = *start_offset;
                 }
                 Operator::End => {
                     let label = labels.pop().unwrap();
@@ -306,11 +282,12 @@ impl Compiler {
                             }
                             let relation = (*stack_count - start_offset) as i32 * 8;
                             code! {self;
-                                Rsp.add(relation)
+                                R11.add(-relation)
                             };
-                            for i in (0..result_len).rev() {
+                            for _ in (0..result_len).rev() {
                                 code! {self;
-                                    Rsp.with_offset(-relation + i as i32 * 8).push()
+                                    Rax.mov(R11.with_offset(relation - result_len as i32 * 8)),
+                                    Self::push_data(Rax)
                                 }
                             }
                             *stack_count = start_offset + result_len;
@@ -345,36 +322,50 @@ impl Compiler {
     pub(crate) unsafe fn compile_func(&mut self, func_index: u32, store: &Store<'_>) -> Result<()> {
         let func = store.get_code(func_index)?;
         let func_type = store.get_func_type_from_func_index(func_index)?;
-        let mut stack_count = 0;
-        let mut labels = vec![Label::FuncEnd(Vec::new())];
         code! {self;
             Rbp.push(),
             Rbp.mov(Rsp),
-            Rsi.push(),
-            Rdx.push(),
-            Rdi.push()
+            Rdi.push(),
+            // R11 is used as a data stack pointer
+            R11.mov(Rsi)
         };
-        stack_count += Self::ARGS_NUM as usize;
-        for i in 0..func_type.params().len() {
+        for i in (0..func_type.params().len()).rev() {
             code! {self;
-                Rax.mov(Rdi.with_offset(i as i32 * 8)),
+                Rax.mov(R11.with_offset(-((i+1) as i32 * 8))),
                 Rax.push()
             };
         }
-        stack_count += func_type.params().len();
+        code! {self;
+            R11.add(-8 * func_type.params().len() as i32)
+        };
+
+        // 16byte align
+        if func_type.params().len() % 2 == 1 {
+            code! {self;
+                Rsp.add(-8)
+            };
+        }
+
         if !func.locals.is_empty() {
             unimplemented!("local variables are not supported yet");
         }
+        let mut stack_count = 0;
+        let mut labels = vec![Label::FuncEnd(Vec::new())];
         self.compile(func, func_index, store, &mut stack_count, &mut labels)?;
-        if func_type.results().len() > 1 {
-            unimplemented!("multiple return values are not supported yet");
+        let result_len = func_type.results().len();
+        if result_len != 0 && result_len != stack_count {
+            code! {self;
+                R11.add(-8 * stack_count as i32)
+            };
+            for _ in 0..result_len {
+                code! {self;
+                    Rax.mov(R11.with_offset(8 * (stack_count - result_len) as i32)),
+                    Self::push_data(Rax)
+                };
+            }
         }
         code! {self;
-            Rax.pop(),
-            Rcx.mov(Rbp.with_offset(-8)),
-            Rdx.mov(0),
-            Rcx.to_mem().mov(Rdx),
-            Rcx.with_offset(8).mov(Rax),
+            Rax.mov(0),
             Rsp.mov(Rbp),
             Rbp.pop(),
             ret()
