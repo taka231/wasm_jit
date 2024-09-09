@@ -53,7 +53,7 @@ impl Value {
 }
 
 const PAGE_SIZE: usize = 4096;
-const STACK_SIZE: usize = PAGE_SIZE * 1;
+const STACK_SIZE: usize = PAGE_SIZE * 4;
 
 extern "C" {
     fn mprotect(addr: *const c_void, len: size_t, prot: c_int) -> c_int;

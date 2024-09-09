@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Register64 {
     Rax,
     Rcx,
@@ -18,7 +18,7 @@ pub enum Register64 {
     R15,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Register32 {
     Eax,
     Ecx,
@@ -36,6 +36,31 @@ pub enum Register32 {
     R13d,
     R14d,
     R15d,
+}
+
+impl From<Register64> for Register32 {
+    fn from(reg: Register64) -> Self {
+        use Register32::*;
+        use Register64::*;
+        match reg {
+            Rax => Eax,
+            Rcx => Ecx,
+            Rdx => Edx,
+            Rbx => Ebx,
+            Rsp => Esp,
+            Rbp => Ebp,
+            Rsi => Esi,
+            Rdi => Edi,
+            R8 => R8d,
+            R9 => R9d,
+            R10 => R10d,
+            R11 => R11d,
+            R12 => R12d,
+            R13 => R13d,
+            R14 => R14d,
+            R15 => R15d,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +315,12 @@ impl Mov<Register64> for Register64 {
     }
 }
 
+impl Mov<Register32> for Register32 {
+    fn mov(self, src: Register32) -> Vec<u8> {
+        opcode_rm_reg(0x89, self, src)
+    }
+}
+
 impl Mov<i32> for Register32 {
     fn mov(self, src: i32) -> Vec<u8> {
         let mut code = vec![];
@@ -440,6 +471,20 @@ impl Cmp<Register64> for Register64 {
 impl Cmp<Register32> for Register32 {
     fn cmp(self, src: Register32) -> Vec<u8> {
         opcode_rm_reg(0x39, self, src)
+    }
+}
+
+impl Cmp<i32> for Register32 {
+    fn cmp(self, src: i32) -> Vec<u8> {
+        let mut code = vec![];
+        let number = self.number();
+        if number >= 8 {
+            code.push(0x41);
+        }
+        code.push(0x81);
+        code.push(mod_rm(3, 7, number));
+        code.extend_from_slice(&src.to_le_bytes());
+        code
     }
 }
 
