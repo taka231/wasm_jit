@@ -1,18 +1,18 @@
 use crate::{
     assembler::{
         ret, Add, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push,
-        Register32::*,
+        Register32::{self, *},
         Register64::{self, *},
         Register8::*,
         Sete, Sub,
     },
     wasm::Func,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use libc::{c_int, c_void, size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
 use std::{
     alloc::{alloc, dealloc, Layout},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
 };
 use wasmparser::{BlockType, Operator};
 
@@ -40,6 +40,7 @@ enum Label {
         address_reserved: Vec<*mut u8>,
         start_offset: usize,
         block_type: BlockType,
+        else_vartual_stack: Option<VartualStack>,
     },
 }
 
@@ -53,6 +54,80 @@ macro_rules! code {
             $self.push_code(&code);
         }
     };
+}
+
+#[derive(Debug, Clone)]
+enum StackValue {
+    Imm(i64),
+    Reg(Register64),
+}
+
+#[derive(Debug, Clone)]
+struct VartualStack {
+    stack: VecDeque<StackValue>,
+    unused_regs: VecDeque<Register64>,
+}
+
+impl VartualStack {
+    fn new() -> VartualStack {
+        VartualStack {
+            stack: VecDeque::new(),
+            unused_regs: VecDeque::from(vec![Rdi, Rsi, Rdx, Rcx, R8, R9, R10]),
+        }
+    }
+
+    unsafe fn get_unused_reg(&mut self, compiler: &mut Compiler) -> Register64 {
+        if let Some(reg) = self.unused_regs.pop_front() {
+            return reg;
+        }
+        loop {
+            let value = self.stack.pop_front().expect("stack is empty");
+            match value {
+                StackValue::Imm(n) => {
+                    code! {compiler;
+                        Rax.mov(n),
+                        Compiler::push_data(Rax)
+                    }
+                }
+                StackValue::Reg(reg) => {
+                    code! {compiler;
+                        Compiler::push_data(reg)
+                    };
+                    return reg;
+                }
+            }
+        }
+    }
+
+    unsafe fn pop_value(&mut self, compiler: &mut Compiler) -> StackValue {
+        if let Some(value) = self.stack.pop_back() {
+            return value;
+        }
+        let reg = self.get_unused_reg(compiler);
+        code! {compiler;
+            Compiler::pop_data(reg)
+        }
+        StackValue::Reg(reg)
+    }
+
+    unsafe fn push_all(&mut self, compiler: &mut Compiler) {
+        while let Some(value) = self.stack.pop_front() {
+            match value {
+                StackValue::Imm(n) => {
+                    code! {compiler;
+                        Rax.mov(n),
+                        Compiler::push_data(Rax)
+                    }
+                }
+                StackValue::Reg(reg) => {
+                    code! {compiler;
+                        Compiler::push_data(reg)
+                    };
+                    self.unused_regs.push_back(reg);
+                }
+            }
+        }
+    }
 }
 
 impl Compiler {
@@ -124,6 +199,7 @@ impl Compiler {
         func_index: u32,
         store: &Store<'_>,
         stack_count: &mut usize,
+        vartual_stack: &mut VartualStack,
         labels: &mut Vec<Label>,
     ) -> Result<()> {
         for instr in &func.body {
@@ -131,6 +207,7 @@ impl Compiler {
                 Operator::Call { function_index } => {
                     let func_type = store.get_func_type_from_func_index(*function_index)?;
                     let args_num = func_type.params().len() as i32;
+                    vartual_stack.push_all(self);
 
                     code! {self;
                         Rdi.mov(Rbp.with_offset(-8)),
@@ -155,74 +232,196 @@ impl Compiler {
                 }
                 Operator::LocalGet { local_index } => {
                     let offset = Compiler::local_offset(*local_index) as i32;
+                    let reg = vartual_stack.get_unused_reg(self);
                     code! {self;
-                        Rax.mov(Rbp.with_offset(-offset)),
-                        Self::push_data(Rax)
+                        reg.mov(Rbp.with_offset(-offset))
                     };
+                    vartual_stack.stack.push_back(StackValue::Reg(reg));
                     *stack_count += 1;
                 }
                 Operator::I32Const { value } => {
-                    code! {self;
-                        Eax.mov(*value),
-                        Self::push_data(Rax)
-                    };
+                    vartual_stack
+                        .stack
+                        .push_back(StackValue::Imm(*value as i64));
                     *stack_count += 1;
                 }
                 Operator::I64Const { value } => {
-                    code! {self;
-                        Rax.mov(*value),
-                        Self::push_data(Rax)
-                    };
+                    vartual_stack.stack.push_back(StackValue::Imm(*value));
                     *stack_count += 1;
                 }
                 Operator::I32Add | Operator::I64Add => {
-                    code! {self;
-                        Self::pop_data(Rdi),
-                        Self::pop_data(Rax),
-                        if instr == &Operator::I32Add {
-                            Eax.add(Edi)
-                        } else {
-                            Rax.add(Rdi)
-                        },
-                        Self::push_data(Rax)
-                    };
+                    let value2 = vartual_stack.pop_value(self);
+                    let value1 = vartual_stack.pop_value(self);
+                    match (value1, value2) {
+                        (StackValue::Imm(n), StackValue::Imm(m)) => {
+                            vartual_stack.stack.push_back(StackValue::Imm(n + m));
+                        }
+                        (StackValue::Reg(reg1), StackValue::Reg(reg2)) => {
+                            if instr == &Operator::I32Add {
+                                let reg1: Register32 = reg1.into();
+                                let reg2: Register32 = reg2.into();
+                                code! {self;
+                                    reg1.add(reg2)
+                                };
+                            } else {
+                                code! {self;
+                                    reg1.add(reg2)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg1));
+                            vartual_stack.unused_regs.push_back(reg2);
+                        }
+                        (StackValue::Reg(reg), StackValue::Imm(n))
+                        | (StackValue::Imm(n), StackValue::Reg(reg)) => {
+                            if instr == &Operator::I32Add {
+                                let reg: Register32 = reg.into();
+                                code! {self;
+                                    Eax.mov(n as i32),
+                                    reg.add(Eax)
+                                };
+                            } else {
+                                code! {self;
+                                    Rax.mov(n),
+                                    reg.add(Rax)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg));
+                        }
+                    }
                     *stack_count -= 1;
                 }
                 Operator::I32Sub | Operator::I64Sub => {
-                    code! {self;
-                        Self::pop_data(Rdi),
-                        Self::pop_data(Rax),
-                        if instr == &Operator::I32Sub {
-                            Eax.sub(Edi)
-                        } else {
-                            Rax.sub(Rdi)
-                        },
-                        Self::push_data(Rax)
-                    };
+                    let value2 = vartual_stack.pop_value(self);
+                    let value1 = vartual_stack.pop_value(self);
+                    match (value1, value2) {
+                        (StackValue::Imm(n), StackValue::Imm(m)) => {
+                            vartual_stack.stack.push_back(StackValue::Imm(n - m));
+                        }
+                        (StackValue::Reg(reg1), StackValue::Reg(reg2)) => {
+                            if instr == &Operator::I32Sub {
+                                let reg1: Register32 = reg1.into();
+                                let reg2: Register32 = reg2.into();
+                                code! {self;
+                                    reg1.sub(reg2)
+                                };
+                            } else {
+                                code! {self;
+                                    reg1.sub(reg2)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg1));
+                            vartual_stack.unused_regs.push_back(reg2);
+                        }
+                        (value1 @ StackValue::Reg(reg), StackValue::Imm(n))
+                        | (value1 @ StackValue::Imm(n), StackValue::Reg(reg)) => {
+                            if matches!(value1, StackValue::Reg(_)) {
+                                if instr == &Operator::I32Sub {
+                                    let reg: Register32 = reg.into();
+                                    code! {self;
+                                        Eax.mov(n as i32),
+                                        reg.sub(Eax)
+                                    };
+                                } else {
+                                    code! {self;
+                                        Rax.mov(n),
+                                        reg.sub(Rax)
+                                    };
+                                }
+                            } else if instr == &Operator::I32Sub {
+                                let reg: Register32 = reg.into();
+                                code! {self;
+                                    Eax.mov(n as i32),
+                                    Eax.sub(reg),
+                                    reg.mov(Eax)
+                                };
+                            } else {
+                                code! {self;
+                                    Rax.mov(n),
+                                    Rax.sub(reg),
+                                    reg.mov(Rax)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg));
+                        }
+                    }
                     *stack_count -= 1;
                 }
                 Operator::I32Eq | Operator::I64Eq => {
-                    code! {self;
-                        Self::pop_data(Rdi),
-                        Self::pop_data(Rax),
-                        if instr == &Operator::I32Eq {
-                            Eax.cmp(Edi)
-                        } else {
-                            Rax.cmp(Rdi)
-                        },
-                        Al.sete(),
-                        Eax.movzx(Al),
-                        Self::push_data(Rax)
-                    };
+                    let value2 = vartual_stack.pop_value(self);
+                    let value1 = vartual_stack.pop_value(self);
+                    match (value1, value2) {
+                        (StackValue::Imm(n), StackValue::Imm(m)) => {
+                            vartual_stack.stack.push_back(StackValue::Imm(if n == m {
+                                1
+                            } else {
+                                0
+                            }));
+                        }
+                        (StackValue::Reg(reg1), StackValue::Reg(reg2)) => {
+                            if instr == &Operator::I32Add {
+                                let reg1: Register32 = reg1.into();
+                                let reg2: Register32 = reg2.into();
+                                code! {self;
+                                    reg1.cmp(reg2),
+                                    Al.sete(),
+                                    Eax.movzx(Al),
+                                    reg1.mov(Eax)
+                                };
+                            } else {
+                                code! {self;
+                                    reg1.cmp(reg2),
+                                    Al.sete(),
+                                    Eax.movzx(Al),
+                                    reg1.mov(Rax)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg1));
+                            vartual_stack.unused_regs.push_back(reg2);
+                        }
+                        (StackValue::Reg(reg), StackValue::Imm(n))
+                        | (StackValue::Imm(n), StackValue::Reg(reg)) => {
+                            if instr == &Operator::I32Add {
+                                let reg: Register32 = reg.into();
+                                code! {self;
+                                    Eax.mov(n as i32),
+                                    reg.cmp(Eax),
+                                    Al.sete(),
+                                    Eax.movzx(Al),
+                                    reg.mov(Eax)
+                                };
+                            } else {
+                                code! {self;
+                                    Rax.mov(n),
+                                    reg.cmp(Rax),
+                                    Al.sete(),
+                                    Eax.movzx(Al),
+                                    reg.mov(Rax)
+                                };
+                            }
+                            vartual_stack.stack.push_back(StackValue::Reg(reg));
+                        }
+                    }
                     *stack_count -= 1;
                 }
                 Operator::If { blockty } => {
-                    code! {self;
-                        Self::pop_data(Rax),
-                        Rdi.mov(0),
-                        Rax.cmp(Rdi),
-                        0_i32.je()
-                    };
+                    let value = vartual_stack.pop_value(self);
+                    match value {
+                        StackValue::Imm(n) => {
+                            code! {self;
+                                Eax.mov(n as i32),
+                                Eax.cmp(0),
+                                0_i32.je()
+                            };
+                        }
+                        StackValue::Reg(reg) => {
+                            let reg32: Register32 = reg.into();
+                            code! {self;
+                                reg32.cmp(0),
+                                0_i32.je()
+                            };
+                            vartual_stack.unused_regs.push_back(reg);
+                        }
+                    }
                     let params_len = match blockty {
                         BlockType::FuncType(n) => {
                             let func_type = store.get_func_type(*n)?;
@@ -235,6 +434,7 @@ impl Compiler {
                         address_reserved: vec![self.p_current],
                         start_offset: *stack_count - params_len,
                         block_type: *blockty,
+                        else_vartual_stack: Some(vartual_stack.clone()),
                     });
                 }
                 Operator::Else => {
@@ -242,11 +442,14 @@ impl Compiler {
                     let Label::End {
                         address_reserved,
                         start_offset,
+                        else_vartual_stack,
                         ..
                     } = label
                     else {
                         unreachable!()
                     };
+                    vartual_stack.push_all(self);
+                    *vartual_stack = else_vartual_stack.take().unwrap();
                     code! {self;
                         0_i32.jmp()
                     };
@@ -264,7 +467,9 @@ impl Compiler {
                             address_reserved,
                             start_offset,
                             block_type,
+                            ..
                         } => {
+                            vartual_stack.push_all(self);
                             for address in address_reserved {
                                 let relative_offset = self.p_current as usize - address as usize;
                                 Compiler::write_i32(address.sub(4), relative_offset as i32);
@@ -281,13 +486,22 @@ impl Compiler {
                                 continue;
                             }
                             let relation = (*stack_count - start_offset) as i32 * 8;
-                            code! {self;
-                                R11.add(-relation)
-                            };
-                            for _ in (0..result_len).rev() {
+                            for _ in 0..result_len.min(7) {
+                                let reg = vartual_stack.get_unused_reg(self);
                                 code! {self;
-                                    Rax.mov(R11.with_offset(relation - result_len as i32 * 8)),
-                                    Self::push_data(Rax)
+                                    Compiler::pop_data(reg)
+                                };
+                                vartual_stack.stack.push_front(StackValue::Reg(reg));
+                            }
+                            if result_len > 7 {
+                                code! {self;
+                                    R11.add(-relation + 7 * 8)
+                                };
+                                for _ in (7..result_len).rev() {
+                                    code! {self;
+                                        Rax.mov(R11.with_offset(relation - result_len as i32 * 8)),
+                                        Self::push_data(Rax)
+                                    }
                                 }
                             }
                             *stack_count = start_offset + result_len;
@@ -351,7 +565,16 @@ impl Compiler {
         }
         let mut stack_count = 0;
         let mut labels = vec![Label::FuncEnd(Vec::new())];
-        self.compile(func, func_index, store, &mut stack_count, &mut labels)?;
+        let mut vartual_stack = VartualStack::new();
+        self.compile(
+            func,
+            func_index,
+            store,
+            &mut stack_count,
+            &mut vartual_stack,
+            &mut labels,
+        )?;
+        vartual_stack.push_all(self);
         let result_len = func_type.results().len();
         if result_len != 0 && result_len != stack_count {
             code! {self;
