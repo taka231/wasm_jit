@@ -12,11 +12,12 @@ use anyhow::{bail, Result};
 use libc::{c_int, c_void, size_t, PROT_EXEC, PROT_READ, PROT_WRITE};
 use std::{
     alloc::{alloc, dealloc, Layout},
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
 };
 use wasmparser::{BlockType, Operator};
 
 use crate::runtime::{store::Store, Runtime};
+use fxhash::FxHashMap;
 
 extern "C" {
     fn mprotect(addr: *const c_void, len: size_t, prot: c_int) -> c_int;
@@ -26,7 +27,7 @@ pub struct Compiler {
     pub p_start: *mut u8,
     pub p_current: *mut u8,
     pub p_func_start: *mut u8,
-    pub func_cache: HashMap<u32, *const ()>,
+    pub func_cache: FxHashMap<u32, *const ()>,
 }
 
 enum Label {
@@ -144,7 +145,7 @@ impl Compiler {
             p_start,
             p_current: p_start,
             p_func_start: p_start,
-            func_cache: HashMap::new(),
+            func_cache: FxHashMap::default(),
         }
     }
 
