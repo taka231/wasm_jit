@@ -535,3 +535,15 @@ impl Jmp for i32 {
         code
     }
 }
+
+pub trait Jne {
+    fn jne(self) -> Vec<u8>;
+}
+
+impl Jne for i32 {
+    fn jne(self) -> Vec<u8> {
+        let mut code = vec![0x0f, 0x85];
+        code.extend_from_slice(&self.to_le_bytes());
+        code
+    }
+}

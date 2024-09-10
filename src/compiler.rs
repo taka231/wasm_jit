@@ -1,6 +1,6 @@
 use crate::{
     assembler::{
-        ret, Add, Call, Cmp, Je, Jmp, Mov, Movzx, Pop, Push,
+        ret, Add, Call, Cmp, Je, Jmp, Jne, Mov, Movzx, Pop, Push,
         Register32::{self, *},
         Register64::{self, *},
         Register8::*,
@@ -64,9 +64,15 @@ enum StackValue {
 }
 
 #[derive(Debug, Clone)]
+enum CmpOp {
+    Eq,
+}
+
+#[derive(Debug, Clone)]
 struct VartualStack {
     stack: VecDeque<StackValue>,
     unused_regs: VecDeque<Register64>,
+    has_cmp: Option<CmpOp>,
 }
 
 impl VartualStack {
@@ -74,6 +80,19 @@ impl VartualStack {
         VartualStack {
             stack: VecDeque::new(),
             unused_regs: VecDeque::from(vec![Rdi, Rsi, Rdx, Rcx, R8, R9, R10]),
+            has_cmp: None,
+        }
+    }
+
+    unsafe fn push_cmp(&mut self, compiler: &mut Compiler) {
+        if let Some(CmpOp::Eq) = self.has_cmp.take() {
+            let reg = self.unused_regs.pop_front().expect("no unused register");
+            code! {compiler;
+                Al.sete(),
+                Eax.movzx(Al),
+                reg.mov(Rax)
+            };
+            self.stack.push_back(StackValue::Reg(reg));
         }
     }
 
@@ -83,6 +102,7 @@ impl VartualStack {
         }
         loop {
             let value = self.stack.pop_front().expect("stack is empty");
+            self.push_cmp(compiler);
             match value {
                 StackValue::Imm(n) => {
                     code! {compiler;
@@ -101,6 +121,7 @@ impl VartualStack {
     }
 
     unsafe fn pop_value(&mut self, compiler: &mut Compiler) -> StackValue {
+        self.push_cmp(compiler);
         if let Some(value) = self.stack.pop_back() {
             return value;
         }
@@ -112,6 +133,7 @@ impl VartualStack {
     }
 
     unsafe fn push_all(&mut self, compiler: &mut Compiler) {
+        self.push_cmp(compiler);
         while let Some(value) = self.stack.pop_front() {
             match value {
                 StackValue::Imm(n) => {
@@ -363,20 +385,15 @@ impl Compiler {
                                 let reg1: Register32 = reg1.into();
                                 let reg2: Register32 = reg2.into();
                                 code! {self;
-                                    reg1.cmp(reg2),
-                                    Al.sete(),
-                                    Eax.movzx(Al),
-                                    reg1.mov(Eax)
+                                    reg1.cmp(reg2)
                                 };
                             } else {
                                 code! {self;
-                                    reg1.cmp(reg2),
-                                    Al.sete(),
-                                    Eax.movzx(Al),
-                                    reg1.mov(Rax)
+                                    reg1.cmp(reg2)
                                 };
                             }
-                            vartual_stack.stack.push_back(StackValue::Reg(reg1));
+                            vartual_stack.has_cmp = Some(CmpOp::Eq);
+                            vartual_stack.unused_regs.push_back(reg1);
                             vartual_stack.unused_regs.push_back(reg2);
                         }
                         (StackValue::Reg(reg), StackValue::Imm(n))
@@ -385,42 +402,43 @@ impl Compiler {
                                 let reg: Register32 = reg.into();
                                 code! {self;
                                     Eax.mov(n as i32),
-                                    reg.cmp(Eax),
-                                    Al.sete(),
-                                    Eax.movzx(Al),
-                                    reg.mov(Eax)
+                                    reg.cmp(Eax)
                                 };
                             } else {
                                 code! {self;
                                     Rax.mov(n),
-                                    reg.cmp(Rax),
-                                    Al.sete(),
-                                    Eax.movzx(Al),
-                                    reg.mov(Rax)
+                                    reg.cmp(Rax)
                                 };
                             }
-                            vartual_stack.stack.push_back(StackValue::Reg(reg));
+                            vartual_stack.has_cmp = Some(CmpOp::Eq);
+                            vartual_stack.unused_regs.push_back(reg);
                         }
                     }
                     *stack_count -= 1;
                 }
                 Operator::If { blockty } => {
-                    let value = vartual_stack.pop_value(self);
-                    match value {
-                        StackValue::Imm(n) => {
-                            code! {self;
-                                Eax.mov(n as i32),
-                                Eax.cmp(0),
-                                0_i32.je()
-                            };
-                        }
-                        StackValue::Reg(reg) => {
-                            let reg32: Register32 = reg.into();
-                            code! {self;
-                                reg32.cmp(0),
-                                0_i32.je()
-                            };
-                            vartual_stack.unused_regs.push_back(reg);
+                    if let Some(CmpOp::Eq) = vartual_stack.has_cmp.take() {
+                        code! {self;
+                            0_i32.jne()
+                        };
+                    } else {
+                        let value = vartual_stack.pop_value(self);
+                        match value {
+                            StackValue::Imm(n) => {
+                                code! {self;
+                                    Eax.mov(n as i32),
+                                    Eax.cmp(0),
+                                    0_i32.je()
+                                };
+                            }
+                            StackValue::Reg(reg) => {
+                                let reg32: Register32 = reg.into();
+                                code! {self;
+                                    reg32.cmp(0),
+                                    0_i32.je()
+                                };
+                                vartual_stack.unused_regs.push_back(reg);
+                            }
                         }
                     }
                     let params_len = match blockty {
