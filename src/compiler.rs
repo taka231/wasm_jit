@@ -501,10 +501,6 @@ impl Compiler {
                                 BlockType::Type(_) => 1,
                                 BlockType::Empty => 0,
                             };
-                            if result_len == *stack_count - start_offset {
-                                continue;
-                            }
-                            let relation = (*stack_count - start_offset) as i32 * 8;
                             for _ in 0..result_len.min(7) {
                                 let reg = vartual_stack.get_unused_reg(self);
                                 code! {self;
@@ -513,16 +509,12 @@ impl Compiler {
                                 vartual_stack.stack.push_front(StackValue::Reg(reg));
                             }
                             if result_len > 7 {
-                                code! {self;
-                                    R11.add(-relation + 7 * 8)
-                                };
-                                for _ in (7..result_len).rev() {
-                                    code! {self;
-                                        Rax.mov(R11.with_offset(relation - result_len as i32 * 8)),
-                                        Self::push_data(Rax)
-                                    }
-                                }
+                                unimplemented!();
                             }
+                            code! {self;
+                                R11.mov(Rbp.with_offset(-16)),
+                                R11.add(8 * start_offset as i32)
+                            };
                             *stack_count = start_offset + result_len;
                         }
                         Label::FuncEnd(address_reserved) => {

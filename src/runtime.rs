@@ -62,7 +62,7 @@ extern "C" {
 impl<'a> Runtime<'a> {
     pub fn init(modules: WasmModule<'a>) -> Runtime<'a> {
         let store = Store::new(modules);
-        let stack_layout = Layout::from_size_align(STACK_SIZE + PAGE_SIZE, 8).unwrap();
+        let stack_layout = Layout::from_size_align(STACK_SIZE + PAGE_SIZE, PAGE_SIZE).unwrap();
         let sp = unsafe { std::alloc::alloc(stack_layout) as *mut u64 };
         unsafe {
             mprotect(
