@@ -73,14 +73,16 @@ struct VartualStack {
     stack: VecDeque<StackValue>,
     unused_regs: VecDeque<Register64>,
     has_cmp: Option<CmpOp>,
+    data_stack_offset: i32,
 }
 
 impl VartualStack {
     fn new() -> VartualStack {
         VartualStack {
             stack: VecDeque::new(),
-            unused_regs: VecDeque::from(vec![Rdi, Rsi, Rdx, Rcx, R8, R9, R10]),
+            unused_regs: VecDeque::from(vec![Rdi, Rsi, Rdx, Rcx, R8, R9, R10, R11]),
             has_cmp: None,
+            data_stack_offset: 0,
         }
     }
 
@@ -107,12 +109,12 @@ impl VartualStack {
                 StackValue::Imm(n) => {
                     code! {compiler;
                         Rax.mov(n),
-                        Compiler::push_data(Rax)
+                        Compiler::push_data(Rax, self)
                     }
                 }
                 StackValue::Reg(reg) => {
                     code! {compiler;
-                        Compiler::push_data(reg)
+                        Compiler::push_data(reg, self)
                     };
                     return reg;
                 }
@@ -127,7 +129,7 @@ impl VartualStack {
         }
         let reg = self.get_unused_reg(compiler);
         code! {compiler;
-            Compiler::pop_data(reg)
+            Compiler::pop_data(reg, self)
         }
         StackValue::Reg(reg)
     }
@@ -139,12 +141,12 @@ impl VartualStack {
                 StackValue::Imm(n) => {
                     code! {compiler;
                         Rax.mov(n),
-                        Compiler::push_data(Rax)
+                        Compiler::push_data(Rax, self)
                     }
                 }
                 StackValue::Reg(reg) => {
                     code! {compiler;
-                        Compiler::push_data(reg)
+                        Compiler::push_data(reg, self)
                     };
                     self.unused_regs.push_back(reg);
                 }
@@ -152,6 +154,9 @@ impl VartualStack {
         }
     }
 }
+
+// DSP: Data Stack Pointer
+const DSP: Register64 = Rbx;
 
 impl Compiler {
     pub(crate) unsafe fn new() -> Compiler {
@@ -196,25 +201,24 @@ impl Compiler {
         }
     }
 
-    unsafe fn push_data(data: Register64) -> Vec<u8> {
-        let mut code = Vec::new();
-        code.extend_from_slice(&R11.to_mem().mov(data));
-        code.extend_from_slice(&R11.add(8));
+    unsafe fn push_data(data: Register64, vartual_stack: &mut VartualStack) -> Vec<u8> {
+        let code = DSP
+            .with_offset(vartual_stack.data_stack_offset * 8)
+            .mov(data);
+        vartual_stack.data_stack_offset += 1;
         code
     }
 
-    unsafe fn pop_data(data: Register64) -> Vec<u8> {
-        let mut code = Vec::new();
-        code.extend_from_slice(&R11.add(-8));
-        code.extend_from_slice(&data.mov(R11.to_mem()));
-        code
+    unsafe fn pop_data(data: Register64, vartual_stack: &mut VartualStack) -> Vec<u8> {
+        vartual_stack.data_stack_offset -= 1;
+        data.mov(DSP.with_offset(vartual_stack.data_stack_offset * 8))
     }
 
     fn local_offset(local_index: u32) -> u32 {
         8 * (Self::LOCAL_BASE_COUNT + 1) + local_index * 8
     }
 
-    const LOCAL_BASE_COUNT: u32 = 1;
+    const LOCAL_BASE_COUNT: u32 = 2;
 
     unsafe fn compile(
         &mut self,
@@ -234,23 +238,20 @@ impl Compiler {
 
                     code! {self;
                         Rdi.mov(Rbp.with_offset(-8)),
-                        Rsi.mov(R11),
+                        Rsi.mov(DSP),
+                        Rsi.add(8 * vartual_stack.data_stack_offset),
                         Edx.mov(*function_index as i32),
                         if *function_index == func_index {
                             R10.mov(self.p_func_start as usize as i64)
                         } else {
                             R10.mov(Runtime::call_func_internal as usize as i64)
                         },
-                        R11.push(),
                         R10.call()
                     }
 
                     *stack_count -= args_num as usize;
 
-                    code! {self;
-                        R11.pop(),
-                        R11.add(8 * (func_type.results().len() as i32 - args_num))
-                    }
+                    vartual_stack.data_stack_offset += func_type.results().len() as i32 - args_num;
                     *stack_count += func_type.results().len();
                 }
                 Operator::LocalGet { local_index } => {
@@ -504,24 +505,15 @@ impl Compiler {
                             if result_len == *stack_count - start_offset {
                                 continue;
                             }
-                            let relation = (*stack_count - start_offset) as i32 * 8;
-                            for _ in 0..result_len.min(7) {
+                            for _ in 0..result_len.min(8) {
                                 let reg = vartual_stack.get_unused_reg(self);
                                 code! {self;
-                                    Compiler::pop_data(reg)
+                                    Compiler::pop_data(reg, vartual_stack)
                                 };
                                 vartual_stack.stack.push_front(StackValue::Reg(reg));
                             }
-                            if result_len > 7 {
-                                code! {self;
-                                    R11.add(-relation + 7 * 8)
-                                };
-                                for _ in (7..result_len).rev() {
-                                    code! {self;
-                                        Rax.mov(R11.with_offset(relation - result_len as i32 * 8)),
-                                        Self::push_data(Rax)
-                                    }
-                                }
+                            if result_len > 8 {
+                                unimplemented!("result_len > 8");
                             }
                             *stack_count = start_offset + result_len;
                         }
@@ -553,24 +545,23 @@ impl Compiler {
     }
 
     pub(crate) unsafe fn compile_func(&mut self, func_index: u32, store: &Store<'_>) -> Result<()> {
+        let mut vartual_stack = VartualStack::new();
         let func = store.get_code(func_index)?;
         let func_type = store.get_func_type_from_func_index(func_index)?;
         code! {self;
             Rbp.push(),
             Rbp.mov(Rsp),
             Rdi.push(),
-            // R11 is used as a data stack pointer
-            R11.mov(Rsi)
+            DSP.push(),
+            DSP.mov(Rsi)
         };
         for i in (0..func_type.params().len()).rev() {
             code! {self;
-                Rax.mov(R11.with_offset(-((i+1) as i32 * 8))),
-                Rax.push()
-            };
+                Self::pop_data(Rax, &mut vartual_stack),
+                Rsp.with_offset(-8 * (i as i32 + 1)).mov(Rax)
+            }
         }
-        code! {self;
-            R11.add(-8 * func_type.params().len() as i32)
-        };
+        Rsp.add(-8 * func_type.params().len() as i32);
 
         // 16byte align
         if func_type.params().len() % 2 == 1 {
@@ -584,7 +575,6 @@ impl Compiler {
         }
         let mut stack_count = 0;
         let mut labels = vec![Label::FuncEnd(Vec::new())];
-        let mut vartual_stack = VartualStack::new();
         self.compile(
             func,
             func_index,
@@ -596,17 +586,16 @@ impl Compiler {
         vartual_stack.push_all(self);
         let result_len = func_type.results().len();
         if result_len != 0 && result_len != stack_count {
-            code! {self;
-                R11.add(-8 * stack_count as i32)
-            };
+            vartual_stack.data_stack_offset -= stack_count as i32;
             for _ in 0..result_len {
                 code! {self;
-                    Rax.mov(R11.with_offset(8 * (stack_count - result_len) as i32)),
-                    Self::push_data(Rax)
+                    Rax.mov(DSP.with_offset(8 * (stack_count - result_len) as i32)),
+                    Self::push_data(Rax, &mut vartual_stack)
                 };
             }
         }
         code! {self;
+            DSP.mov(Rbp.with_offset(-16)),
             Rax.mov(0),
             Rsp.mov(Rbp),
             Rbp.pop(),
