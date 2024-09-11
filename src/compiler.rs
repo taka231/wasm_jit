@@ -214,7 +214,7 @@ impl Compiler {
         8 * (Self::LOCAL_BASE_COUNT + 1) + local_index * 8
     }
 
-    const LOCAL_BASE_COUNT: u32 = 1;
+    const LOCAL_BASE_COUNT: u32 = 2;
 
     unsafe fn compile(
         &mut self,
@@ -562,18 +562,19 @@ impl Compiler {
             // R11 is used as a data stack pointer
             R11.mov(Rsi)
         };
-        for i in (0..func_type.params().len()).rev() {
+        code! {self;
+            R11.add(-8 * func_type.params().len() as i32),
+            R11.push()
+        };
+        for i in 0..func_type.params().len() {
             code! {self;
-                Rax.mov(R11.with_offset(-((i+1) as i32 * 8))),
+                Rax.mov(R11.with_offset(i as i32 * 8)),
                 Rax.push()
             };
         }
-        code! {self;
-            R11.add(-8 * func_type.params().len() as i32)
-        };
 
         // 16byte align
-        if func_type.params().len() % 2 == 1 {
+        if func_type.params().len() % 2 == 0 {
             code! {self;
                 Rsp.add(-8)
             };
